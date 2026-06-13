@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  
+  "name": "Dhi.io — Focus Analytics",
+  "description": "Know where your mind goes. Dhi tracks your web focus patterns and scores your productivity in real time.",
+  "version": "1.0",
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon16.png",
+    "48": "icon16.png",
+    "128": "icon16.png"
+  },
+  "permissions": ["tabs", "idle", "storage","alarms"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon16.png",
+      "48": "icon16.png",
+      "128": "icon16.png"
+    },
+    "default_popup": "index.html"
+  }
+}
