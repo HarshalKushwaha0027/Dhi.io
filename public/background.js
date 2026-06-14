@@ -1,54 +1,125 @@
 // ── State ────────────────────────────────────────────────────────────────────
 let currentTabState = { tabId: null, url: null, startTime: null }
 const audioTimers = {}
+let switchLog = []
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Category map ─────────────────────────────────────────────────────────────
+const CATEGORIES = {
+  productive: [
+    'github.com','stackoverflow.com','notion.so','figma.com',
+    'jira.atlassian.com','docs.google.com','developer.mozilla.org',
+    'linear.app','vercel.com','npmjs.com','codepen.io','replit.com',
+    'leetcode.com','kaggle.com','coursera.org','udemy.com','freecodecamp.org',
+    'medium.com','dev.to','hashnode.com'
+  ],
+  neutral: [
+    'google.com','gmail.com','outlook.com','calendar.google.com',
+    'maps.google.com','wikipedia.org','accounts.google.com',
+    'drive.google.com','meet.google.com','zoom.us','slack.com'
+  ],
+  unproductive: [
+    'youtube.com','twitter.com','x.com','reddit.com',
+    'netflix.com','instagram.com','facebook.com','tiktok.com',
+    'twitch.tv','pinterest.com','snapchat.com','discord.com'
+  ]
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function getDomain(url) {
   if (!url) return null
   try {
     const h = new URL(url).hostname
-      .replace('www.', '')      // strip www.
-      .replace('m.', '')        // strip mobile subdomain too
+      .replace('www.', '')
+      .replace('m.', '')
       .toLowerCase()
     if (!h || h === 'newtab' || h === 'extensions') return null
-    return h
+    // strip country/language subdomains like en., fr., pt.
+    const parts = h.split('.')
+    return parts.length > 2 ? parts.slice(-2).join('.') : h
   } catch { return null }
 }
 
 function isIgnored(url) {
   if (!url) return true
-  return url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('about:')
+  return url.startsWith('chrome://') ||
+         url.startsWith('chrome-extension://') ||
+         url.startsWith('about:')
 }
 
+// ── getCategory MUST be at top level ─────────────────────────────────────────
+function getCategory(domain) {
+  if (!domain) return 'neutral'
+  for (const [cat, list] of Object.entries(CATEGORIES)) {
+    if (list.some(d => domain.includes(d))) return cat
+  }
+  return 'neutral'
+}
+
+// ── Save time — stores { time, category } per domain ─────────────────────────
 async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!domain) return
   const weighted = timeInSeconds * weight
-  if (weighted < 0.5) return // ignore < 0.5s blips
+  if (weighted < 0.5) return
+
   const data = await chrome.storage.local.get(['domainStats'])
   const stats = data.domainStats || {}
-  stats[domain] = (stats[domain] || 0) + weighted
+
+  const existing = stats[domain] || { time: 0, category: getCategory(domain) }
+  stats[domain] = {
+    time: existing.time + weighted,
+    category: getCategory(domain)
+  }
+
   await chrome.storage.local.set({ domainStats: stats })
-  console.log(`💾 ${domain}: +${weighted.toFixed(1)}s (weight=${weight}) | total=${stats[domain].toFixed(1)}s`)
+  console.log(`💾 ${domain} [${stats[domain].category}]: +${weighted.toFixed(1)}s | total=${stats[domain].time.toFixed(1)}s`)
 }
 
 // ── Keep service worker alive ─────────────────────────────────────────────────
-// Chrome kills the SW after ~30s — this alarm pings it every 25s to keep it awake
-chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 }) // every 25s
+chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive') {
-    console.log('🔄 SW keepalive ping')
+  if (alarm.name === 'keepAlive') console.log('🔄 SW keepalive ping')
+})
+
+// ── Daily reset at midnight ───────────────────────────────────────────────────
+chrome.alarms.create('dailyReset', { when: nextMidnight(), periodInMinutes: 1440 })
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'dailyReset') {
+    chrome.storage.local.set({ domainStats: {} })
+    console.log('🌅 Daily reset — stats cleared')
   }
 })
+
+function nextMidnight() {
+  const now = new Date()
+  const midnight = new Date(now)
+  midnight.setHours(24, 0, 0, 0)
+  return midnight.getTime()
+}
 
 // ── Tab switches (Active time) ────────────────────────────────────────────────
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   const now = Date.now()
 
+  // Context switch alert
+  switchLog.push(now)
+  switchLog = switchLog.filter(t => now - t < 3 * 60 * 1000)
+  if (switchLog.length > 10) {
+    chrome.notifications.create('switchAlert', {
+    type: 'basic',
+    iconUrl: chrome.runtime.getURL('icon16.png'), // ← use runtime URL
+    title: 'Dhi — focus check',
+    message: 'You switched tabs rapidly. Take a breath. 🧘'
+  })
+    switchLog = []
+  }
+
   // Save time for previous tab
   if (currentTabState.tabId !== null && currentTabState.startTime !== null) {
     const timeSpent = (now - currentTabState.startTime) / 1000
     const domain = getDomain(currentTabState.url)
-    if (domain) await saveTimeSpent(domain, timeSpent, 1.0)
+    if (domain && !isIgnored(currentTabState.url)) {
+      await saveTimeSpent(domain, timeSpent, 1.0)
+    }
   }
 
   // Start tracking new tab
@@ -62,9 +133,8 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   }
 })
 
-// Update URL when page navigates inside same tab
+// ── URL navigation within same tab ────────────────────────────────────────────
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // Track URL changes in the active tab
   if (tabId === currentTabState.tabId && changeInfo.url) {
     const now = Date.now()
     const oldDomain = getDomain(currentTabState.url)
@@ -80,7 +150,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     console.log(`🔀 URL changed → ${newDomain || 'ignored'}`)
   }
 
-  // Audio tracking (passive - 0.3x weight)
+  // Audio tracking (passive 0.3× weight)
   if (changeInfo.audible === true) {
     const domain = getDomain(tab.url)
     if (domain) {
@@ -124,12 +194,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       saveTimeSpent(domain, secs, 1.0).then(() => {
         currentTabState.startTime = Date.now()
         chrome.storage.local.get(['domainStats'], (data) => {
-          sendResponse({ stats: data.domainStats || {} })
+          sendResponse({ stats: data.domainStats || {}, switchCount: switchLog.length })
         })
       })
     } else {
       chrome.storage.local.get(['domainStats'], (data) => {
-        sendResponse({ stats: data.domainStats || {} })
+        sendResponse({ stats: data.domainStats || {}, switchCount: switchLog.length })
       })
     }
     return true

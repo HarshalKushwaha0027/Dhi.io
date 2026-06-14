@@ -10,7 +10,7 @@
     "48": "icon16.png",
     "128": "icon16.png"
   },
-  "permissions": ["tabs", "idle", "storage","alarms"],
+  "permissions": ["tabs", "idle", "storage","alarms","notifications"],
   "background": {
     "service_worker": "background.js"
   },
