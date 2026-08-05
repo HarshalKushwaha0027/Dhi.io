@@ -3,7 +3,7 @@ let currentTabState = { tabId: null, url: null, startTime: null }
 const audioTimers = {}
 let switchLog = []
 
-// ── Category map ─────────────────────────────────────────────────────────────
+// ── Default category map (overridable per-domain via customCategories) ───────
 const CATEGORIES = {
   productive: [
     'github.com','stackoverflow.com','notion.so','figma.com',
@@ -33,7 +33,6 @@ function getDomain(url) {
       .replace('m.', '')
       .toLowerCase()
     if (!h || h === 'newtab' || h === 'extensions') return null
-    // strip country/language subdomains like en., fr., pt.
     const parts = h.split('.')
     return parts.length > 2 ? parts.slice(-2).join('.') : h
   } catch { return null }
@@ -46,9 +45,10 @@ function isIgnored(url) {
          url.startsWith('about:')
 }
 
-// ── getCategory MUST be at top level ─────────────────────────────────────────
-function getCategory(domain) {
+// getCategory now checks user overrides FIRST, then falls back to defaults
+function getCategory(domain, overrides = {}) {
   if (!domain) return 'neutral'
+  if (overrides[domain]) return overrides[domain]
   for (const [cat, list] of Object.entries(CATEGORIES)) {
     if (list.some(d => domain.includes(d))) return cat
   }
@@ -61,13 +61,14 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   const weighted = timeInSeconds * weight
   if (weighted < 0.5) return
 
-  const data = await chrome.storage.local.get(['domainStats'])
-  const stats = data.domainStats || {}
+  const data = await chrome.storage.local.get(['domainStats', 'customCategories'])
+  const stats     = data.domainStats || {}
+  const overrides = data.customCategories || {}
 
-  const existing = stats[domain] || { time: 0, category: getCategory(domain) }
+  const existing = stats[domain] || { time: 0, category: getCategory(domain, overrides) }
   stats[domain] = {
     time: existing.time + weighted,
-    category: getCategory(domain)
+    category: getCategory(domain, overrides)
   }
 
   await chrome.storage.local.set({ domainStats: stats })
@@ -76,16 +77,33 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
 
 // ── Keep service worker alive ─────────────────────────────────────────────────
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive') console.log('🔄 SW keepalive ping')
-})
 
-// ── Daily reset at midnight ───────────────────────────────────────────────────
+// ── Daily reset at midnight — saves today into history first ─────────────────
 chrome.alarms.create('dailyReset', { when: nextMidnight(), periodInMinutes: 1440 })
-chrome.alarms.onAlarm.addListener((alarm) => {
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'keepAlive') {
+    console.log('🔄 SW keepalive ping')
+    return
+  }
+
   if (alarm.name === 'dailyReset') {
-    chrome.storage.local.set({ domainStats: {} })
-    console.log('🌅 Daily reset — stats cleared')
+    const data = await chrome.storage.local.get(['domainStats', 'history'])
+    const todayStats = data.domainStats || {}
+    const history     = data.history || {}
+
+    const todayKey  = new Date().toISOString().split('T')[0]
+    const entries   = Object.values(todayStats)
+    const totalTime = entries.reduce((s, x) => s + (x?.time || 0), 0)
+
+    if (totalTime > 0) {
+      history[todayKey] = { domainStats: todayStats, totalTime, savedAt: Date.now() }
+      const keys = Object.keys(history).sort()
+      while (keys.length > 7) delete history[keys.shift()]
+    }
+
+    await chrome.storage.local.set({ domainStats: {}, history })
+    console.log(`🌅 Daily reset — saved ${todayKey} to history, stats cleared`)
   }
 })
 
@@ -100,20 +118,18 @@ function nextMidnight() {
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   const now = Date.now()
 
-  // Context switch alert
   switchLog.push(now)
   switchLog = switchLog.filter(t => now - t < 3 * 60 * 1000)
   if (switchLog.length > 10) {
     chrome.notifications.create('switchAlert', {
-    type: 'basic',
-    iconUrl: chrome.runtime.getURL('icon16.png'), // ← use runtime URL
-    title: 'Dhi — focus check',
-    message: 'You switched tabs rapidly. Take a breath. 🧘'
-  })
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icon16.png'),
+      title: 'Dhi — focus check',
+      message: 'You switched tabs 10+ times in 3 minutes. Take a breath. 🧘'
+    })
     switchLog = []
   }
 
-  // Save time for previous tab
   if (currentTabState.tabId !== null && currentTabState.startTime !== null) {
     const timeSpent = (now - currentTabState.startTime) / 1000
     const domain = getDomain(currentTabState.url)
@@ -122,7 +138,6 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     }
   }
 
-  // Start tracking new tab
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId)
     currentTabState = { tabId: activeInfo.tabId, url: tab.url, startTime: now }
@@ -150,7 +165,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     console.log(`🔀 URL changed → ${newDomain || 'ignored'}`)
   }
 
-  // Audio tracking (passive 0.3× weight)
   if (changeInfo.audible === true) {
     const domain = getDomain(tab.url)
     if (domain) {
