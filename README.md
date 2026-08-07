@@ -131,8 +131,8 @@ npm run build
 - [x] Daily auto-reset
 
 ### Phase 2 — Deeper analytics (next)
-- [ ] Weekly history chart (per-day breakdown)
-- [ ] User-defined custom site categories
+- [x] Weekly history chart (per-day breakdown)
+- [x] User-defined custom site categories
 - [ ] Focus mode — block distracting sites for a set time
 - [ ] Export data as CSV
 
