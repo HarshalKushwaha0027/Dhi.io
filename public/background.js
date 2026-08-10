@@ -24,6 +24,49 @@ const CATEGORIES = {
   ]
 }
 
+// ── Heuristic guesser — used ONLY when no exact match found ──────────────────
+// Not ML — just keyword + TLD pattern matching. Marked "guessed" so the UI
+// can show it as unconfirmed until the user clicks to confirm/correct it.
+const TLD_HINTS = {
+  '.edu': 'productive',
+  '.ac.': 'productive',
+  '.gov': 'neutral',
+}
+
+const KEYWORD_HINTS = {
+  productive: [
+    'docs','doc','wiki','learn','course','courses','academy','university',
+    'code','coding','dev','api','git','ide','build','tutorial','tool',
+    'office','design','sheet','sheets','cloud','school','class'
+  ],
+  neutral: [
+    'mail','search','maps','map','weather','news','bank','finance',
+    'calendar','translate','forecast'
+  ],
+  unproductive: [
+    'game','games','gaming','video','stream','tv','movie','movies','anime',
+    'bet','casino','shop','shopping','deal','deals','social','chat',
+    'meme','memes','tube','watch'
+  ]
+}
+
+function guessCategory(domain) {
+  if (!domain) return null
+
+  for (const [tld, cat] of Object.entries(TLD_HINTS)) {
+    if (domain.includes(tld)) return cat
+  }
+
+  const base = domain.replace(/\.[a-z]{2,}$/, '')
+  const tokens = base.split(/[.\-]/)
+
+  for (const [cat, words] of Object.entries(KEYWORD_HINTS)) {
+    if (words.some(w => tokens.includes(w) || domain.includes(w))) return cat
+  }
+
+  return null // no signal found at all
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getDomain(url) {
   if (!url) return null
@@ -45,17 +88,25 @@ function isIgnored(url) {
          url.startsWith('about:')
 }
 
-// getCategory now checks user overrides FIRST, then falls back to defaults
+// getCategory returns { category, guessed } —
+// guessed=false means an exact override or exact default match.
+// guessed=true means the heuristic (or a plain neutral fallback) decided it.
 function getCategory(domain, overrides = {}) {
-  if (!domain) return 'neutral'
-  if (overrides[domain]) return overrides[domain]
+  if (!domain) return { category: 'neutral', guessed: false }
+
+  if (overrides[domain]) return { category: overrides[domain], guessed: false }
+
   for (const [cat, list] of Object.entries(CATEGORIES)) {
-    if (list.some(d => domain.includes(d))) return cat
+    if (list.some(d => domain.includes(d))) return { category: cat, guessed: false }
   }
-  return 'neutral'
+
+  const guess = guessCategory(domain)
+  if (guess) return { category: guess, guessed: true }
+
+  return { category: 'neutral', guessed: true }
 }
 
-// ── Save time — stores { time, category } per domain ─────────────────────────
+// ── Save time — stores { time, category, guessed } per domain ────────────────
 async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!domain) return
   const weighted = timeInSeconds * weight
@@ -65,14 +116,16 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   const stats     = data.domainStats || {}
   const overrides = data.customCategories || {}
 
-  const existing = stats[domain] || { time: 0, category: getCategory(domain, overrides) }
+  const { category, guessed } = getCategory(domain, overrides)
+  const existing = stats[domain] || { time: 0 }
   stats[domain] = {
     time: existing.time + weighted,
-    category: getCategory(domain, overrides)
+    category,
+    guessed
   }
 
   await chrome.storage.local.set({ domainStats: stats })
-  console.log(`💾 ${domain} [${stats[domain].category}]: +${weighted.toFixed(1)}s | total=${stats[domain].time.toFixed(1)}s`)
+  console.log(`💾 ${domain} [${category}${guessed ? ' •guess' : ''}]: +${weighted.toFixed(1)}s | total=${stats[domain].time.toFixed(1)}s`)
 }
 
 // ── Keep service worker alive ─────────────────────────────────────────────────

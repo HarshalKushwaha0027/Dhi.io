@@ -106,20 +106,21 @@ function Bar({ pct, color }) {
   )
 }
 
-// ── Clickable category pill — click to cycle P → N → U → P ──────────────────
-function CatPill({ category, onClick }) {
+// ── Clickable category pill — dashed = guessed, solid = confirmed ────────────
+function CatPill({ category, guessed, onClick }) {
   const color = CAT_COLOR[category] || '#9a9ab0'
   const labels = { productive: 'P', neutral: 'N', unproductive: 'U' }
   return (
     <button
       onClick={onClick}
-      title="Click to recategorize"
+      title={guessed ? 'Guessed — click to confirm or change' : 'Click to recategorize'}
       style={{
         fontSize: 9, fontWeight: 700, color,
-        border: `1px solid ${color}55`, borderRadius: 4,
+        border: `1px ${guessed ? 'dashed' : 'solid'} ${color}${guessed ? '99' : '55'}`,
+        borderRadius: 4,
         padding: '1px 4px', letterSpacing: '0.04em', flexShrink: 0,
         background: 'none', cursor: 'pointer', fontFamily: 'inherit',
-      }}>{labels[category] || '?'}</button>
+      }}>{labels[category] || '?'}{guessed ? '?' : ''}</button>
   )
 }
 
@@ -138,6 +139,7 @@ export default function Popup() {
           domain: getDomain(domain),
           time:     typeof val === 'object' ? val.time     : val,
           category: typeof val === 'object' ? val.category : 'neutral',
+          guessed:  typeof val === 'object' ? !!val.guessed : false,
         }))
         .filter(x => x.time > 0)
         .sort((a, b) => b.time - a.time)
@@ -161,12 +163,12 @@ export default function Popup() {
       })
     } else {
       processStats({
-        'github.com':        { time: 5400, category: 'productive' },
-        'youtube.com':       { time: 3200, category: 'unproductive' },
-        'notion.so':         { time: 2800, category: 'productive' },
-        'twitter.com':       { time: 900,  category: 'unproductive' },
-        'google.com':        { time: 600,  category: 'neutral' },
-        'stackoverflow.com': { time: 400,  category: 'productive' },
+        'github.com':        { time: 5400, category: 'productive',   guessed: false },
+        'youtube.com':       { time: 3200, category: 'unproductive', guessed: false },
+        'leetcode.com':      { time: 1800, category: 'productive',   guessed: true  },
+        'twitter.com':       { time: 900,  category: 'unproductive', guessed: false },
+        'google.com':        { time: 600,  category: 'neutral',      guessed: false },
+        'randomblog.io':     { time: 400,  category: 'neutral',      guessed: true  },
       }, 4)
     }
   }, [])
@@ -195,12 +197,12 @@ export default function Popup() {
   }
 
   // Click a pill → cycle category → save override → patch today's stats → update UI
+  // Also flips guessed → false, since a click always means "this is confirmed now"
   const cycleCategory = async (domain, currentCat) => {
     const next = CAT_ORDER[(CAT_ORDER.indexOf(currentCat) + 1) % CAT_ORDER.length]
 
     if (typeof chrome === 'undefined' || !chrome.storage) {
-      // dev fallback — just update local state
-      const updated = sites.map(s => s.domain === domain ? { ...s, category: next } : s)
+      const updated = sites.map(s => s.domain === domain ? { ...s, category: next, guessed: false } : s)
       setSites(updated)
       setPI(computePI(updated))
       return
@@ -212,12 +214,12 @@ export default function Popup() {
 
     const { domainStats = {} } = await chrome.storage.local.get(['domainStats'])
     if (domainStats[domain]) {
-      domainStats[domain] = { ...domainStats[domain], category: next }
+      domainStats[domain] = { ...domainStats[domain], category: next, guessed: false }
       await chrome.storage.local.set({ domainStats })
     }
 
     setSites(prev => {
-      const updated = prev.map(s => s.domain === domain ? { ...s, category: next } : s)
+      const updated = prev.map(s => s.domain === domain ? { ...s, category: next, guessed: false } : s)
       setPI(computePI(updated))
       return updated
     })
@@ -308,13 +310,13 @@ export default function Popup() {
 
         <div style={s.sectionTitle}>
           <span>Top destinations</span>
-          <span style={s.hint}>click P/N/U to recategorize</span>
+          <span style={s.hint}>dashed "?" = guessed, click to confirm</span>
         </div>
         {sites.map((site, i) => (
           <div key={site.domain} style={{...s.siteRow, borderBottom: i===sites.length-1?'none':s.siteRow.borderBottom}}>
             <div style={{...s.avatar, color:site.color, border:`1px solid ${site.color}33`}}>{siteIcon(site.domain)}</div>
             <span style={s.siteName}>{site.domain}</span>
-            <CatPill category={site.category} onClick={() => cycleCategory(site.domain, site.category)} />
+            <CatPill category={site.category} guessed={site.guessed} onClick={() => cycleCategory(site.domain, site.category)} />
             <Bar pct={total>0?site.time/total:0} color={site.color} />
             <span style={s.siteTime}>{fmt(site.time)}</span>
           </div>
