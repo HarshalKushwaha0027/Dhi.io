@@ -178,7 +178,7 @@ export default function Popup() {
 
   const clearData = () => {
     if (typeof chrome !== 'undefined' && chrome.storage) {
-      chrome.storage.local.set({ domainStats: {} }, () => {
+      chrome.storage.local.set({ domainStats: {}, hourlyToday: {} }, () => {
         setSites([]); setTotal(0); setPI(0); setSwitches(0); setStatus('empty')
       })
     }

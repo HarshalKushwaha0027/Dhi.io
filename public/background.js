@@ -25,8 +25,6 @@ const CATEGORIES = {
 }
 
 // ── Heuristic guesser — used ONLY when no exact match found ──────────────────
-// Not ML — just keyword + TLD pattern matching. Marked "guessed" so the UI
-// can show it as unconfirmed until the user clicks to confirm/correct it.
 const TLD_HINTS = {
   '.edu': 'productive',
   '.ac.': 'productive',
@@ -64,7 +62,7 @@ function guessCategory(domain) {
     if (words.some(w => tokens.includes(w) || domain.includes(w))) return cat
   }
 
-  return null // no signal found at all
+  return null
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -88,33 +86,28 @@ function isIgnored(url) {
          url.startsWith('about:')
 }
 
-// getCategory returns { category, guessed } —
-// guessed=false means an exact override or exact default match.
-// guessed=true means the heuristic (or a plain neutral fallback) decided it.
 function getCategory(domain, overrides = {}) {
   if (!domain) return { category: 'neutral', guessed: false }
-
   if (overrides[domain]) return { category: overrides[domain], guessed: false }
-
   for (const [cat, list] of Object.entries(CATEGORIES)) {
     if (list.some(d => domain.includes(d))) return { category: cat, guessed: false }
   }
-
   const guess = guessCategory(domain)
   if (guess) return { category: guess, guessed: true }
-
   return { category: 'neutral', guessed: true }
 }
 
-// ── Save time — stores { time, category, guessed } per domain ────────────────
+// ── Save time — stores { time, category, guessed } per domain,             ──
+// ── AND buckets the same chunk of time into hourlyToday[hour][category]   ──
 async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!domain) return
   const weighted = timeInSeconds * weight
   if (weighted < 0.5) return
 
-  const data = await chrome.storage.local.get(['domainStats', 'customCategories'])
-  const stats     = data.domainStats || {}
-  const overrides = data.customCategories || {}
+  const data = await chrome.storage.local.get(['domainStats', 'customCategories', 'hourlyToday'])
+  const stats       = data.domainStats  || {}
+  const overrides   = data.customCategories || {}
+  const hourlyToday = data.hourlyToday  || {}
 
   const { category, guessed } = getCategory(domain, overrides)
   const existing = stats[domain] || { time: 0 }
@@ -124,14 +117,19 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
     guessed
   }
 
-  await chrome.storage.local.set({ domainStats: stats })
-  console.log(`💾 ${domain} [${category}${guessed ? ' •guess' : ''}]: +${weighted.toFixed(1)}s | total=${stats[domain].time.toFixed(1)}s`)
+  // Bucket into the current hour of day (0-23)
+  const hour = new Date().getHours()
+  if (!hourlyToday[hour]) hourlyToday[hour] = { productive: 0, neutral: 0, unproductive: 0 }
+  hourlyToday[hour][category] = (hourlyToday[hour][category] || 0) + weighted
+
+  await chrome.storage.local.set({ domainStats: stats, hourlyToday })
+  console.log(`💾 ${domain} [${category}${guessed ? ' •guess' : ''}] @${hour}h: +${weighted.toFixed(1)}s | total=${stats[domain].time.toFixed(1)}s`)
 }
 
 // ── Keep service worker alive ─────────────────────────────────────────────────
 chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
 
-// ── Daily reset at midnight — saves today into history first ─────────────────
+// ── Daily reset at midnight — saves today (incl. hourly) into history ────────
 chrome.alarms.create('dailyReset', { when: nextMidnight(), periodInMinutes: 1440 })
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -141,22 +139,28 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 
   if (alarm.name === 'dailyReset') {
-    const data = await chrome.storage.local.get(['domainStats', 'history'])
-    const todayStats = data.domainStats || {}
-    const history     = data.history || {}
+    const data = await chrome.storage.local.get(['domainStats', 'history', 'hourlyToday'])
+    const todayStats  = data.domainStats  || {}
+    const history     = data.history      || {}
+    const hourlyToday = data.hourlyToday  || {}
 
     const todayKey  = new Date().toISOString().split('T')[0]
     const entries   = Object.values(todayStats)
     const totalTime = entries.reduce((s, x) => s + (x?.time || 0), 0)
 
     if (totalTime > 0) {
-      history[todayKey] = { domainStats: todayStats, totalTime, savedAt: Date.now() }
+      history[todayKey] = {
+        domainStats: todayStats,
+        totalTime,
+        hourly: hourlyToday,
+        savedAt: Date.now(),
+      }
       const keys = Object.keys(history).sort()
       while (keys.length > 7) delete history[keys.shift()]
     }
 
-    await chrome.storage.local.set({ domainStats: {}, history })
-    console.log(`🌅 Daily reset — saved ${todayKey} to history, stats cleared`)
+    await chrome.storage.local.set({ domainStats: {}, history, hourlyToday: {} })
+    console.log(`🌅 Daily reset — saved ${todayKey} to history (incl. hourly), stats cleared`)
   }
 })
 

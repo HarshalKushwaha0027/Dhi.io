@@ -11,13 +11,20 @@ function fmt(secs) {
 function dateKey(offsetDays = 0) {
   const d = new Date()
   d.setDate(d.getDate() - offsetDays)
-  return d.toISOString().split('T')[0] // 'YYYY-MM-DD'
+  return d.toISOString().split('T')[0]
 }
 
 function dayLabel(key) {
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-  const d = new Date(key + 'T12:00:00') // noon avoids timezone shift
+  const d = new Date(key + 'T12:00:00')
   return days[d.getDay()]
+}
+
+function hourLabel(h) {
+  const period = h < 12 ? 'am' : 'pm'
+  let hh = h % 12
+  if (hh === 0) hh = 12
+  return `${hh}${period}`
 }
 
 function computePI(domainStats) {
@@ -46,7 +53,112 @@ function piLabel(score) {
   return 'Distracted'
 }
 
-// ── Stacked Bar Chart (pure SVG) ──────────────────────────────────────────────
+// ── Fold every stored day's hourly data + today's live hourly data ───────────
+// into 24 buckets of { productive, neutral, unproductive } seconds.
+function aggregateHourly(history, hourlyToday) {
+  const buckets = {}
+  for (let h = 0; h < 24; h++) buckets[h] = { productive: 0, neutral: 0, unproductive: 0 }
+
+  const foldIn = (hourlyObj) => {
+    Object.entries(hourlyObj || {}).forEach(([hourStr, catTimes]) => {
+      const h = Number(hourStr)
+      if (!buckets[h]) buckets[h] = { productive: 0, neutral: 0, unproductive: 0 }
+      buckets[h].productive   += catTimes?.productive   || 0
+      buckets[h].neutral      += catTimes?.neutral      || 0
+      buckets[h].unproductive += catTimes?.unproductive || 0
+    })
+  }
+
+  Object.values(history || {}).forEach(dayEntry => foldIn(dayEntry?.hourly))
+  foldIn(hourlyToday)
+
+  return buckets
+}
+
+// Minimum aggregated seconds in an hour bucket before we trust its PI —
+// avoids one stray 61-second visit at 3am skewing the forecast.
+const MIN_SAMPLE_SECONDS = 120
+
+function computeHourlyPI(buckets) {
+  return Array.from({ length: 24 }, (_, h) => {
+    const b = buckets[h] || { productive: 0, neutral: 0, unproductive: 0 }
+    const total = b.productive + b.neutral + b.unproductive
+    if (total < MIN_SAMPLE_SECONDS) return { hour: h, total, pi: null }
+    const weighted = b.productive * 1.0 + b.neutral * 0.5 + b.unproductive * -1.0
+    const pi = Math.max(0, Math.min(100, Math.round((weighted / total) * 100)))
+    return { hour: h, total, pi }
+  })
+}
+
+// ── Focus Forecast — hourly bar chart + best/worst callout ───────────────────
+function FocusForecast({ hourlyPIArr }) {
+  const withData = hourlyPIArr.filter(h => h.pi !== null)
+
+  if (withData.length === 0) {
+    return (
+      <div style={{ fontSize: 12, color: '#6b6b85', padding: '20px 0', textAlign: 'center', lineHeight: 1.6 }}>
+        Forecast needs a bit more data — keep browsing for a day or two and check back.
+      </div>
+    )
+  }
+
+  const best  = withData.reduce((a, b) => a.pi > b.pi ? a : b)
+  const worst = withData.reduce((a, b) => a.pi < b.pi ? a : b)
+
+  const W = 640, H = 200
+  const PAD = { top: 16, bottom: 26, left: 32, right: 10 }
+  const chartW = W - PAD.left - PAD.right
+  const chartH = H - PAD.top - PAD.bottom
+  const slot = chartW / 24
+  const barW = slot - 2
+
+  return (
+    <div>
+      <div style={{ fontSize: 13, color: '#c5c5d8', marginBottom: 14, lineHeight: 1.6 }}>
+        Your focus peaks around <strong style={{ color: '#06D6A0' }}>{hourLabel(best.hour)}</strong> (avg PI {best.pi})
+        {best.hour !== worst.hour && <> · dips around <strong style={{ color: '#FF6B6B' }}>{hourLabel(worst.hour)}</strong> (avg PI {worst.pi})</>}
+      </div>
+
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
+        {[0, 25, 50, 75, 100].map(v => {
+          const y = PAD.top + chartH * (1 - v / 100)
+          return (
+            <g key={v}>
+              <line x1={PAD.left} x2={W - PAD.right} y1={y} y2={y} stroke="#1e1e2e" strokeWidth="1" />
+              <text x={PAD.left - 6} y={y + 3} textAnchor="end" fill="#6b6b85" fontSize="9" fontFamily="monospace">{v}</text>
+            </g>
+          )
+        })}
+
+        {hourlyPIArr.map((h, i) => {
+          const x = PAD.left + i * slot + 1
+          if (h.pi === null) {
+            return <rect key={i} x={x} y={PAD.top + chartH - 3} width={barW} height={3} rx={1} fill="#1e1e2e" />
+          }
+          const barH = Math.max(2, (h.pi / 100) * chartH)
+          const color = piColor(h.pi)
+          const isBest  = h.hour === best.hour
+          const isWorst = h.hour === worst.hour
+          return (
+            <rect key={i} x={x} y={PAD.top + chartH - barH} width={barW} height={barH} rx={2}
+              fill={color} opacity={isBest || isWorst ? 1 : 0.55}
+              stroke={isBest ? '#06D6A0' : isWorst ? '#FF6B6B' : 'none'}
+              strokeWidth={isBest || isWorst ? 1.5 : 0} />
+          )
+        })}
+
+        {[0, 6, 12, 18, 23].map(h => (
+          <text key={h} x={PAD.left + h * slot + slot / 2} y={H - 8}
+            textAnchor="middle" fill="#6b6b85" fontSize="9" fontFamily="monospace">
+            {hourLabel(h)}
+          </text>
+        ))}
+      </svg>
+    </div>
+  )
+}
+
+// ── Stacked Bar Chart (daily) ─────────────────────────────────────────────────
 function WeeklyChart({ days }) {
   const W = 640
   const H = 260
@@ -60,7 +172,6 @@ function WeeklyChart({ days }) {
 
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
-      {/* Y-axis grid lines */}
       {[0, 0.25, 0.5, 0.75, 1].map((pct, i) => {
         const y = PAD.top + chartH * (1 - pct)
         return (
@@ -75,56 +186,41 @@ function WeeklyChart({ days }) {
         )
       })}
 
-      {/* Bars */}
       {days.map((day, i) => {
         const x = PAD.left + i * gap + (gap - barW) / 2
         const totalH = maxTime > 0 ? (day.totalTime / maxTime) * chartH : 0
 
-        // Split bar into productive / neutral / unproductive
-        const prod   = day.productiveTime / maxTime * chartH
+        const prod    = day.productiveTime / maxTime * chartH
         const neutral = day.neutralTime   / maxTime * chartH
-        const unprod = day.unproductiveTime / maxTime * chartH
+        const unprod  = day.unproductiveTime / maxTime * chartH
 
         const isToday = day.key === dateKey(0)
 
         return (
           <g key={day.key}>
-            {/* Unproductive (bottom) */}
             {unprod > 0 && (
               <rect x={x} y={PAD.top + chartH - unprod}
-                width={barW} height={unprod}
-                rx="0" fill="#FF6B6B" opacity="0.85" />
+                width={barW} height={unprod} fill="#FF6B6B" opacity="0.85" />
             )}
-            {/* Neutral (middle) */}
             {neutral > 0 && (
               <rect x={x} y={PAD.top + chartH - unprod - neutral}
-                width={barW} height={neutral}
-                rx="0" fill="#FFD166" opacity="0.85" />
+                width={barW} height={neutral} fill="#FFD166" opacity="0.85" />
             )}
-            {/* Productive (top) */}
             {prod > 0 && (
               <rect x={x} y={PAD.top + chartH - unprod - neutral - prod}
-                width={barW} height={prod}
-                rx="3" fill="#06D6A0" opacity="0.85" />
+                width={barW} height={prod} rx="3" fill="#06D6A0" opacity="0.85" />
             )}
-
-            {/* Empty bar placeholder */}
             {day.totalTime === 0 && (
               <rect x={x} y={PAD.top + chartH - 4}
                 width={barW} height={4} rx="2" fill="#1e1e2e" />
             )}
-
-            {/* PI score above bar */}
             {day.totalTime > 0 && (
-              <text x={x + barW / 2}
-                y={PAD.top + chartH - totalH - 6}
+              <text x={x + barW / 2} y={PAD.top + chartH - totalH - 6}
                 textAnchor="middle" fill={piColor(day.pi)}
                 fontSize="10" fontWeight="700" fontFamily="monospace">
                 {day.pi}
               </text>
             )}
-
-            {/* Day label */}
             <text x={x + barW / 2} y={H - 8}
               textAnchor="middle"
               fill={isToday ? '#7C6FFF' : '#6b6b85'}
@@ -159,7 +255,6 @@ function PISparkline({ days }) {
 
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
-      {/* 50% line */}
       <line x1={PAD} x2={W - PAD}
         y1={PAD + (chartH - PAD / 2) * 0.5}
         y2={PAD + (chartH - PAD / 2) * 0.5}
@@ -222,7 +317,6 @@ function SummaryCards({ days }) {
 
 // ── Top sites this week ───────────────────────────────────────────────────────
 function TopSitesWeek({ days }) {
-  // Merge all domainStats across the week
   const merged = {}
   days.forEach(day => {
     Object.entries(day.domainStats || {}).forEach(([domain, val]) => {
@@ -274,32 +368,42 @@ function TopSitesWeek({ days }) {
 
 // ── Main History page ─────────────────────────────────────────────────────────
 export default function History() {
-  const [days, setDays]     = useState([])
-  const [status, setStatus] = useState('loading')
+  const [days, setDays]         = useState([])
+  const [hourlyPIArr, setHourlyPIArr] = useState([])
+  const [status, setStatus]     = useState('loading')
 
   useEffect(() => {
     const load = () => {
       if (typeof chrome !== 'undefined' && chrome.storage) {
-        chrome.storage.local.get(['domainStats', 'history'], (data) => {
-          buildDays(data.domainStats || {}, data.history || {})
+        chrome.storage.local.get(['domainStats', 'history', 'hourlyToday'], (data) => {
+          buildDays(data.domainStats || {}, data.history || {}, data.hourlyToday || {})
         })
       } else {
-        // Dev fallback
+        // Dev fallback — includes mock hourly patterns too
+        const mockHourly = {
+          9:  { productive: 2400, neutral: 300,  unproductive: 200 },
+          10: { productive: 2800, neutral: 200,  unproductive: 100 },
+          11: { productive: 2200, neutral: 400,  unproductive: 300 },
+          14: { productive: 600,  neutral: 300,  unproductive: 2400 },
+          15: { productive: 500,  neutral: 200,  unproductive: 2800 },
+          20: { productive: 300,  neutral: 100,  unproductive: 1800 },
+        }
         buildDays(
           { 'github.com': { time: 5400, category: 'productive' }, 'youtube.com': { time: 3200, category: 'unproductive' } },
           {
-            [dateKey(1)]: { domainStats: { 'github.com': { time: 7200, category: 'productive' }, 'twitter.com': { time: 1800, category: 'unproductive' } }, totalTime: 9000 },
-            [dateKey(2)]: { domainStats: { 'stackoverflow.com': { time: 4800, category: 'productive' }, 'youtube.com': { time: 5400, category: 'unproductive' } }, totalTime: 10200 },
-            [dateKey(3)]: { domainStats: { 'notion.so': { time: 6300, category: 'productive' }, 'reddit.com': { time: 900, category: 'unproductive' } }, totalTime: 7200 },
-            [dateKey(4)]: { domainStats: { 'github.com': { time: 3600, category: 'productive' }, 'google.com': { time: 1200, category: 'neutral' } }, totalTime: 4800 },
-            [dateKey(5)]: { domainStats: { 'netflix.com': { time: 7200, category: 'unproductive' }, 'youtube.com': { time: 3600, category: 'unproductive' } }, totalTime: 10800 },
-            [dateKey(6)]: { domainStats: { 'figma.com': { time: 5400, category: 'productive' }, 'github.com': { time: 3600, category: 'productive' } }, totalTime: 9000 },
-          }
+            [dateKey(1)]: { domainStats: { 'github.com': { time: 7200, category: 'productive' }, 'twitter.com': { time: 1800, category: 'unproductive' } }, totalTime: 9000, hourly: mockHourly },
+            [dateKey(2)]: { domainStats: { 'stackoverflow.com': { time: 4800, category: 'productive' }, 'youtube.com': { time: 5400, category: 'unproductive' } }, totalTime: 10200, hourly: mockHourly },
+            [dateKey(3)]: { domainStats: { 'notion.so': { time: 6300, category: 'productive' }, 'reddit.com': { time: 900, category: 'unproductive' } }, totalTime: 7200, hourly: mockHourly },
+            [dateKey(4)]: { domainStats: { 'github.com': { time: 3600, category: 'productive' }, 'google.com': { time: 1200, category: 'neutral' } }, totalTime: 4800, hourly: mockHourly },
+            [dateKey(5)]: { domainStats: { 'netflix.com': { time: 7200, category: 'unproductive' }, 'youtube.com': { time: 3600, category: 'unproductive' } }, totalTime: 10800, hourly: mockHourly },
+            [dateKey(6)]: { domainStats: { 'figma.com': { time: 5400, category: 'productive' }, 'github.com': { time: 3600, category: 'productive' } }, totalTime: 9000, hourly: mockHourly },
+          },
+          mockHourly
         )
       }
     }
 
-    const buildDays = (todayStats, history) => {
+    const buildDays = (todayStats, history, hourlyToday) => {
       const result = []
 
       for (let i = 6; i >= 0; i--) {
@@ -315,18 +419,17 @@ export default function History() {
         const unproductiveTime = entries.filter(x => x?.category === 'unproductive').reduce((s, x) => s + x.time, 0)
 
         result.push({
-          key,
-          isToday,
-          domainStats: stats,
-          totalTime,
-          productiveTime,
-          neutralTime,
-          unproductiveTime,
+          key, isToday, domainStats: stats, totalTime,
+          productiveTime, neutralTime, unproductiveTime,
           pi: computePI(stats),
         })
       }
 
+      const hourlyBuckets = aggregateHourly(history, hourlyToday)
+      const hourlyPI = computeHourlyPI(hourlyBuckets)
+
       setDays(result)
+      setHourlyPIArr(hourlyPI)
       setStatus('ok')
     }
 
@@ -335,14 +438,10 @@ export default function History() {
 
   const s = {
     root: {
-      minHeight: '100vh',
-      background: '#13131f',
-      color: '#fff',
+      minHeight: '100vh', background: '#13131f', color: '#fff',
       fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
-      padding: '28px 36px 48px',
-      boxSizing: 'border-box',
-      maxWidth: 760,
-      margin: '0 auto',
+      padding: '28px 36px 48px', boxSizing: 'border-box',
+      maxWidth: 760, margin: '0 auto',
     },
     header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 },
     logo:   { display: 'flex', alignItems: 'center', gap: 10 },
@@ -370,7 +469,6 @@ export default function History() {
 
   return (
     <div style={s.root}>
-      {/* Header */}
       <div style={s.header}>
         <div>
           <div style={s.logo}>
@@ -394,13 +492,18 @@ export default function History() {
         </div>
       ) : (
         <>
-          {/* Summary cards */}
           <div style={s.section}>
             <div style={s.sectionTitle}>Week at a glance</div>
             <SummaryCards days={days} />
           </div>
 
-          {/* Stacked bar chart */}
+          <div style={s.section}>
+            <div style={s.sectionTitle}>Focus forecast</div>
+            <FocusForecast hourlyPIArr={hourlyPIArr} />
+          </div>
+
+          <div style={s.divider} />
+
           <div style={s.section}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
               <div style={s.sectionTitle}>Time breakdown</div>
@@ -415,7 +518,6 @@ export default function History() {
 
           <div style={s.divider} />
 
-          {/* PI sparkline */}
           <div style={s.section}>
             <div style={s.sectionTitle}>Productivity Index trend</div>
             <PISparkline days={days} />
@@ -423,7 +525,6 @@ export default function History() {
 
           <div style={s.divider} />
 
-          {/* Top sites this week */}
           <div style={s.section}>
             <div style={s.sectionTitle}>Top sites this week</div>
             <TopSitesWeek days={days} />
