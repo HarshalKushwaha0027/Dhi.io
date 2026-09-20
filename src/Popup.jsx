@@ -34,7 +34,6 @@ function siteIcon(domain) {
   return domain.slice(0, 2).toUpperCase()
 }
 
-// ── Productivity Index ────────────────────────────────────────────────────────
 function computePI(sites) {
   const weights = { productive: 1.0, neutral: 0.5, unproductive: -1.0 }
   const totalTime = sites.reduce((s, x) => s + x.time, 0)
@@ -76,8 +75,7 @@ function DonutChart({ sites, total }) {
   let offset = 0
   const slices = sites.map((s) => {
     const dash = total > 0 ? (s.time / total) * circumference : 0
-    const gap  = circumference - dash
-    const slice = { ...s, dash, gap, offset }
+    const slice = { ...s, dash, gap: circumference - dash, offset }
     offset += dash
     return slice
   })
@@ -105,21 +103,13 @@ function Bar({ pct, color }) {
   )
 }
 
-// ── Category pill ─────────────────────────────────────────────────────────────
-// guessed=true → dashed + "?" suffix
-// source='content' → shows a small ◈ dot to indicate content-aware origin
 function CatPill({ category, guessed, source, onClick }) {
   const color = CAT_COLOR[category] || '#9a9ab0'
   const labels = { productive: 'P', neutral: 'N', unproductive: 'U' }
   const isContent = source === 'content'
-  const title = isContent
-    ? `Content-aware suggestion — click to confirm or change`
-    : guessed
-    ? `Guessed from domain name — click to confirm or change`
-    : `Click to recategorize`
-
   return (
-    <button onClick={onClick} title={title}
+    <button onClick={onClick}
+      title={isContent ? 'Content-aware — click to confirm' : guessed ? 'Guessed — click to confirm' : 'Click to recategorize'}
       style={{
         fontSize: 9, fontWeight: 700, color,
         border: `1px ${guessed ? 'dashed' : 'solid'} ${color}${guessed ? '99' : '55'}`,
@@ -133,54 +123,29 @@ function CatPill({ category, guessed, source, onClick }) {
   )
 }
 
-// ── Site row ──────────────────────────────────────────────────────────────────
 function SiteRow({ site, total, onCycle, isLast }) {
   const [expanded, setExpanded] = useState(false)
-
   return (
     <div>
-      <div
-        style={{
-          display: 'flex', alignItems: 'center', gap: 8,
-          padding: '6px 0',
-          borderBottom: isLast && !expanded ? 'none' : '1px solid #1a1a2a',
-          cursor: site.title ? 'pointer' : 'default',
-        }}
-        onClick={() => site.title && setExpanded(e => !e)}
-      >
-        <div style={{
-          width: 26, height: 26, borderRadius: 6, background: '#1e1e2e',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 10, fontWeight: 700, flexShrink: 0,
-          color: site.color, border: `1px solid ${site.color}33`
-        }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0',
+        borderBottom: isLast && !expanded ? 'none' : '1px solid #1a1a2a',
+        cursor: site.title ? 'pointer' : 'default',
+      }} onClick={() => site.title && setExpanded(e => !e)}>
+        <div style={{ width: 26, height: 26, borderRadius: 6, background: '#1e1e2e', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0, color: site.color, border: `1px solid ${site.color}33` }}>
           {siteIcon(site.domain)}
         </div>
         <span style={{ flex: 1, fontSize: 12, color: '#c5c5d8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {site.domain}
         </span>
-        <CatPill
-          category={site.category}
-          guessed={site.guessed}
-          source={site.source}
-          onClick={(e) => { e.stopPropagation(); onCycle() }}
-        />
+        <CatPill category={site.category} guessed={site.guessed} source={site.source}
+          onClick={(e) => { e.stopPropagation(); onCycle() }} />
         <Bar pct={total > 0 ? site.time / total : 0} color={site.color} />
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#fff', minWidth: 36, textAlign: 'right' }}>
-          {fmt(site.time)}
-        </span>
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#fff', minWidth: 36, textAlign: 'right' }}>{fmt(site.time)}</span>
       </div>
-
-      {/* Expanded title row — shown when content script captured a page title */}
       {expanded && site.title && (
-        <div style={{
-          fontSize: 10, color: '#6b6b85', padding: '4px 34px 8px',
-          borderBottom: isLast ? 'none' : '1px solid #1a1a2a',
-          lineHeight: 1.5,
-        }}>
-          {site.source === 'content' && (
-            <span style={{ color: '#7C6FFF', marginRight: 4 }}>◈ content-aware</span>
-          )}
+        <div style={{ fontSize: 10, color: '#6b6b85', padding: '4px 34px 8px', borderBottom: isLast ? 'none' : '1px solid #1a1a2a', lineHeight: 1.5 }}>
+          {site.source === 'content' && <span style={{ color: '#7C6FFF', marginRight: 4 }}>◈ content-aware</span>}
           "{site.title}"
         </div>
       )}
@@ -188,22 +153,65 @@ function SiteRow({ site, total, onCycle, isLast }) {
   )
 }
 
+// ── Spiral warning strip ──────────────────────────────────────────────────────
+function SpiralWarning({ warning, onDismiss }) {
+  if (!warning?.active) return null
+
+  const minutesAgo = warning.since
+    ? Math.round((Date.now() - warning.since) / 60000)
+    : null
+
+  return (
+    <div style={{
+      background: '#1a0f00',
+      border: '1px solid #F77F0066',
+      borderRadius: 8,
+      padding: '10px 12px',
+      marginBottom: 12,
+      display: 'flex',
+      alignItems: 'flex-start',
+      gap: 10,
+    }}>
+      {/* Animated spiral icon */}
+      <span style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>🌀</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: '#F77F00', marginBottom: 3 }}>
+          Focus spiral detected
+        </div>
+        <div style={{ fontSize: 11, color: '#9a6b3a', lineHeight: 1.5 }}>
+          You're cycling between the same distracting sites
+          {minutesAgo !== null && minutesAgo > 0 ? ` for ${minutesAgo}m` : ''}.
+          Try switching to something productive for 5 minutes.
+        </div>
+      </div>
+      <button
+        onClick={onDismiss}
+        style={{
+          background: 'none', border: 'none', color: '#6b6b85',
+          fontSize: 14, cursor: 'pointer', padding: '0 2px', lineHeight: 1, flexShrink: 0,
+        }}
+        title="Dismiss — I'm on it">✕</button>
+    </div>
+  )
+}
+
 // ── Main popup ────────────────────────────────────────────────────────────────
 export default function Popup() {
-  const [sites, setSites]       = useState([])
-  const [total, setTotal]       = useState(0)
-  const [pi, setPI]             = useState(0)
-  const [switches, setSwitches] = useState(0)
-  const [status, setStatus]     = useState('loading')
+  const [sites, setSites]           = useState([])
+  const [total, setTotal]           = useState(0)
+  const [pi, setPI]                 = useState(0)
+  const [switches, setSwitches]     = useState(0)
+  const [spiralWarning, setSpiral]  = useState({ active: false })
+  const [status, setStatus]         = useState('loading')
 
   useEffect(() => {
-    const processStats = (raw, switchCount = 0) => {
+    const processStats = (raw, switchCount = 0, spiral = { active: false }) => {
       const entries = Object.entries(raw)
         .map(([domain, val]) => ({
           domain:   getDomain(domain),
           time:     typeof val === 'object' ? (val.time     || 0) : val,
           category: typeof val === 'object' ? (val.category || 'neutral') : 'neutral',
-          guessed:  typeof val === 'object' ? !!val.guessed : false,
+          guessed:  typeof val === 'object' ? !!val.guessed  : false,
           source:   typeof val === 'object' ? (val.source   || 'domain') : 'domain',
           title:    typeof val === 'object' ? (val.title    || null) : null,
           contentSuggestion: typeof val === 'object' ? (val.contentSuggestion || null) : null,
@@ -221,64 +229,68 @@ export default function Popup() {
       setTotal(tot)
       setPI(computePI(entries))
       setSwitches(switchCount)
+      setSpiral(spiral)
       setStatus('ok')
     }
 
     if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
       chrome.runtime.sendMessage({ action: 'getLatestStats' }, (response) => {
         if (chrome.runtime.lastError) { setStatus('error'); return }
-        processStats(response?.stats || {}, response?.switchCount || 0)
+        processStats(response?.stats || {}, response?.switchCount || 0, response?.spiralWarning || { active: false })
       })
     } else {
+      // Dev fallback — show the spiral warning so you can style it
       processStats({
-        'github.com':    { time: 5400, category: 'productive',   guessed: false, source: 'domain',    title: null },
-        'medium.com':    { time: 3200, category: 'unproductive', guessed: true,  source: 'content',   title: 'Top 10 Netflix Shows You Must Watch', contentSuggestion: 'unproductive', contentConfidence: 82 },
-        'medium.com/2':  { time: 1800, category: 'productive',   guessed: true,  source: 'content',   title: 'Building a React App from Scratch', contentSuggestion: 'productive',   contentConfidence: 76 },
-        'twitter.com':   { time: 900,  category: 'unproductive', guessed: false, source: 'domain',    title: null },
-        'google.com':    { time: 600,  category: 'neutral',      guessed: false, source: 'domain',    title: null },
-        'newsite.io':    { time: 400,  category: 'productive',   guessed: true,  source: 'heuristic', title: null },
-      }, 4)
+        'github.com':  { time: 5400, category: 'productive',   guessed: false, source: 'domain', title: null },
+        'youtube.com': { time: 3200, category: 'unproductive', guessed: false, source: 'domain', title: null },
+        'reddit.com':  { time: 1800, category: 'unproductive', guessed: false, source: 'domain', title: null },
+        'twitter.com': { time: 900,  category: 'unproductive', guessed: false, source: 'domain', title: null },
+        'google.com':  { time: 600,  category: 'neutral',      guessed: false, source: 'domain', title: null },
+        'newsite.io':  { time: 400,  category: 'productive',   guessed: true,  source: 'heuristic', title: null },
+      }, 4, { active: true, since: Date.now() - 4 * 60 * 1000 })
     }
   }, [])
 
-  const topSite = sites[0]
-  const piInfo  = piLabel(pi)
+  const piInfo = piLabel(pi)
 
   const clearData = () => {
     if (typeof chrome !== 'undefined' && chrome.storage) {
       chrome.storage.local.set({ domainStats: {}, hourlyToday: {} }, () => {
-        setSites([]); setTotal(0); setPI(0); setSwitches(0); setStatus('empty')
+        setSites([]); setTotal(0); setPI(0); setSwitches(0)
+        setSpiral({ active: false }); setStatus('empty')
       })
     }
   }
 
-  const openHistory  = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }) }
-  const openSettings = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') }) }
+  const dismissSpiral = () => {
+    setSpiral({ active: false })
+    if (typeof chrome !== 'undefined' && chrome.runtime) {
+      chrome.runtime.sendMessage({ action: 'dismissSpiral' })
+    }
+  }
 
   const cycleCategory = async (domain, currentCat) => {
     const next = CAT_ORDER[(CAT_ORDER.indexOf(currentCat) + 1) % CAT_ORDER.length]
-
     if (typeof chrome === 'undefined' || !chrome.storage) {
       const updated = sites.map(s => s.domain === domain ? { ...s, category: next, guessed: false, source: 'user' } : s)
       setSites(updated); setPI(computePI(updated)); return
     }
-
     const { customCategories = {} } = await chrome.storage.local.get(['customCategories'])
     customCategories[domain] = next
     await chrome.storage.local.set({ customCategories })
-
     const { domainStats = {} } = await chrome.storage.local.get(['domainStats'])
     if (domainStats[domain]) {
       domainStats[domain] = { ...domainStats[domain], category: next, guessed: false, source: 'user' }
       await chrome.storage.local.set({ domainStats })
     }
-
     setSites(prev => {
       const updated = prev.map(s => s.domain === domain ? { ...s, category: next, guessed: false, source: 'user' } : s)
-      setPI(computePI(updated))
-      return updated
+      setPI(computePI(updated)); return updated
     })
   }
+
+  const openHistory  = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }) }
+  const openSettings = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') }) }
 
   const s = {
     root: { width: 360, minHeight: 500, background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", fontSize: 13, padding: '14px 16px 18px', boxSizing: 'border-box', userSelect: 'none' },
@@ -310,7 +322,14 @@ export default function Popup() {
   return (
     <div style={s.root}>
       <div style={s.header}>
-        <div style={s.logo}><div style={s.logoDot}/><span style={s.logoText}>Dhi.io</span></div>
+        <div style={s.logo}>
+          <div style={s.logoDot}/>
+          <span style={s.logoText}>Dhi.io</span>
+          {/* Spiral badge in logo area — subtle amber dot when warning active */}
+          {spiralWarning?.active && (
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#F77F00', boxShadow: '0 0 6px #F77F00', marginLeft: 2 }} />
+          )}
+        </div>
         <div style={s.headerRight}>
           <button style={s.gearBtn} onClick={openSettings} title="Category settings">⚙</button>
           <span style={s.pill}>LIVE</span>
@@ -322,6 +341,9 @@ export default function Popup() {
       {status === 'empty'   && <div style={s.center}><div style={{fontSize:32}}>🎯</div><div style={{fontSize:14,fontWeight:600,color:'#9a9ab0'}}>No data yet</div><div style={{fontSize:12,color:'#6b6b85',maxWidth:220,lineHeight:1.6}}>Browse a few tabs and come back.</div></div>}
 
       {status === 'ok' && <>
+        {/* Spiral warning — shows above chart when active */}
+        <SpiralWarning warning={spiralWarning} onDismiss={dismissSpiral} />
+
         <div style={s.topRow}>
           <DonutChart sites={sites} total={total} />
           <div style={s.rightCol}>
@@ -354,13 +376,8 @@ export default function Popup() {
         </div>
 
         {sites.map((site, i) => (
-          <SiteRow
-            key={site.domain}
-            site={site}
-            total={total}
-            isLast={i === sites.length - 1}
-            onCycle={() => cycleCategory(site.domain, site.category)}
-          />
+          <SiteRow key={site.domain} site={site} total={total} isLast={i === sites.length - 1}
+            onCycle={() => cycleCategory(site.domain, site.category)} />
         ))}
 
         <div style={s.footer}>

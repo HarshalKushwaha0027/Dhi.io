@@ -3,6 +3,19 @@ let currentTabState = { tabId: null, url: null, startTime: null }
 const audioTimers = {}
 let switchLog = []
 
+// ── Rolling activity buffer — last 30 min of tab visits ──────────────────────
+// Each entry: { domain, category, time (secs), timestamp }
+// Used exclusively by the spiral detector. Never persisted to storage.
+let recentActivity = []
+
+// Spiral state — tracks whether we've already warned this session
+let spiralState = {
+  warned: false,        // early warning shown in popup
+  notified: false,      // Chrome notification sent
+  detectedAt: null,     // when the spiral was first detected
+  clearedAt: null,      // when the user recovered
+}
+
 // ── Default category map ──────────────────────────────────────────────────────
 const CATEGORIES = {
   productive: [
@@ -24,9 +37,7 @@ const CATEGORIES = {
   ]
 }
 
-// ── Content-aware keyword scorer ──────────────────────────────────────────────
-// Runs on the title + meta + h1 text sent by content.js.
-// Returns { category, confidence } or null if no clear signal.
+// ── Content keyword scorer ────────────────────────────────────────────────────
 const CONTENT_KEYWORDS = {
   productive: [
     'tutorial','documentation','docs','guide','learn','course','lesson',
@@ -54,32 +65,22 @@ const CONTENT_KEYWORDS = {
 
 function scoreContent(signals) {
   if (!signals) return null
-
   const text = signals.toLowerCase()
   const scores = { productive: 0, neutral: 0, unproductive: 0 }
-
   for (const [cat, words] of Object.entries(CONTENT_KEYWORDS)) {
     for (const word of words) {
-      if (text.includes(word)) {
-        // Longer matches = more specific = higher confidence
-        scores[cat] += word.split(' ').length
-      }
+      if (text.includes(word)) scores[cat] += word.split(' ').length
     }
   }
-
   const total = scores.productive + scores.neutral + scores.unproductive
   if (total === 0) return null
-
   const winner = Object.entries(scores).reduce((a, b) => a[1] > b[1] ? a : b)
-  const confidence = winner[1] / total // 0.0 – 1.0
-
-  // Only return a result if the winning category has clear dominance (>45%)
+  const confidence = winner[1] / total
   if (confidence < 0.45) return null
-
   return { category: winner[0], confidence: Math.round(confidence * 100) }
 }
 
-// ── TLD + domain keyword guesser (fallback) ───────────────────────────────────
+// ── TLD + domain keyword guesser ──────────────────────────────────────────────
 const TLD_HINTS = { '.edu': 'productive', '.ac.': 'productive', '.gov': 'neutral' }
 const KEYWORD_HINTS = {
   productive: ['docs','doc','wiki','learn','course','courses','academy','university','code','coding','dev','api','git','ide','build','tutorial','tool','office','design','sheet','sheets','cloud','school','class'],
@@ -127,6 +128,101 @@ function getCategory(domain, overrides = {}) {
   return { category: 'neutral', guessed: true, source: 'default' }
 }
 
+// ── Spiral detector ───────────────────────────────────────────────────────────
+
+const WINDOW_MS       = 15 * 60 * 1000  // 15-minute rolling window
+const HALF_WINDOW_MS  =  7 * 60 * 1000  // split at 7 min for acceleration test
+const NOTIFY_DELAY_MS =  5 * 60 * 1000  // notify if spiral persists 5 more min
+
+function pruneBuffer() {
+  const cutoff = Date.now() - WINDOW_MS
+  recentActivity = recentActivity.filter(e => e.timestamp > cutoff)
+}
+
+function detectSpiral() {
+  pruneBuffer()
+  const now = Date.now()
+
+  // Need at least 5 events to make a meaningful assessment
+  if (recentActivity.length < 5) return { spiral: false }
+
+  const unprod = recentActivity.filter(e => e.category === 'unproductive')
+
+  // Signal 1 — Repetition: same unproductive domain visited 2+ times in window
+  const domainCounts = {}
+  for (const e of unprod) {
+    domainCounts[e.domain] = (domainCounts[e.domain] || 0) + 1
+  }
+  const repeated = Object.values(domainCounts).some(c => c >= 2)
+  if (!repeated) return { spiral: false }
+
+  // Signal 2 — Acceleration: more unproductive events in second half vs first half
+  const firstHalf  = recentActivity.filter(e => now - e.timestamp > HALF_WINDOW_MS)
+  const secondHalf = recentActivity.filter(e => now - e.timestamp <= HALF_WINDOW_MS)
+  const firstUnprod  = firstHalf.filter(e => e.category === 'unproductive').length
+  const secondUnprod = secondHalf.filter(e => e.category === 'unproductive').length
+  const accelerating = secondUnprod > firstUnprod
+  if (!accelerating) return { spiral: false }
+
+  // Signal 3 — Drift: ratio of unproductive time is worsening
+  const firstTotal   = firstHalf.reduce((s, e) => s + e.time, 0) || 1
+  const secondTotal  = secondHalf.reduce((s, e) => s + e.time, 0) || 1
+  const firstRatio   = firstHalf.filter(e => e.category === 'unproductive').reduce((s, e) => s + e.time, 0) / firstTotal
+  const secondRatio  = secondHalf.filter(e => e.category === 'unproductive').reduce((s, e) => s + e.time, 0) / secondTotal
+  const drifting     = secondRatio > firstRatio + 0.1  // at least 10% worse
+
+  if (!drifting) return { spiral: false }
+
+  // All 3 signals fired — identify the spiral domains for the message
+  const spiralDomains = Object.entries(domainCounts)
+    .filter(([, c]) => c >= 2)
+    .sort(([, a], [, b]) => b - a)
+    .map(([d]) => d)
+    .slice(0, 2)
+
+  return { spiral: true, spiralDomains, secondRatio: Math.round(secondRatio * 100) }
+}
+
+// Runs every 2 minutes via alarm
+function runSpiralCheck() {
+  const result = detectSpiral()
+
+  if (!result.spiral) {
+    // Recovery — reset if user was in a spiral but PI is improving
+    if (spiralState.warned || spiralState.notified) {
+      spiralState = { warned: false, notified: false, detectedAt: null, clearedAt: Date.now() }
+      console.log('✅ Spiral cleared — focus recovered')
+    }
+    return
+  }
+
+  const now = Date.now()
+  console.log(`🌀 Spiral detected — domains: ${result.spiralDomains.join(', ')}, ${result.secondRatio}% unproductive`)
+
+  if (!spiralState.warned) {
+    // Stage 1: set warning flag — popup picks this up on next open
+    spiralState.warned = true
+    spiralState.detectedAt = now
+    console.log('⚠️ Spiral warning set (popup will show badge)')
+  }
+
+  if (spiralState.warned && !spiralState.notified) {
+    const elapsed = now - (spiralState.detectedAt || now)
+    if (elapsed >= NOTIFY_DELAY_MS) {
+      // Stage 2: spiral persisted for 5 min → send Chrome notification
+      spiralState.notified = true
+      const siteList = result.spiralDomains.join(' → ')
+      chrome.notifications.create('spiralAlert', {
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icon16.png'),
+        title: 'Dhi — Focus spiral detected',
+        message: `You've been cycling: ${siteList}. Take a 2-minute break before getting back to work.`
+      })
+      console.log('🔔 Spiral notification sent')
+    }
+  }
+}
+
 // ── Save time ─────────────────────────────────────────────────────────────────
 async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!domain) return
@@ -138,7 +234,6 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   const overrides   = data.customCategories || {}
   const hourlyToday = data.hourlyToday      || {}
 
-  // Preserve content-suggested category if already set, else use normal logic
   const existing = stats[domain]
   const { category, guessed, source } = existing?.source === 'content'
     ? { category: existing.category, guessed: existing.guessed, source: 'content' }
@@ -146,9 +241,7 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
 
   stats[domain] = {
     time: (existing?.time || 0) + weighted,
-    category,
-    guessed,
-    source,
+    category, guessed, source,
     title: existing?.title || null,
   }
 
@@ -156,18 +249,29 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!hourlyToday[hour]) hourlyToday[hour] = { productive: 0, neutral: 0, unproductive: 0 }
   hourlyToday[hour][category] = (hourlyToday[hour][category] || 0) + weighted
 
+  // Push into rolling buffer for spiral detection
+  recentActivity.push({ domain, category, time: weighted, timestamp: Date.now() })
+
   await chrome.storage.local.set({ domainStats: stats, hourlyToday })
   console.log(`💾 ${domain} [${category} via ${source}${guessed ? ' •guess' : ''}]: +${weighted.toFixed(1)}s`)
 }
 
-// ── Keep service worker alive ─────────────────────────────────────────────────
-chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 })
-
-// ── Daily reset ───────────────────────────────────────────────────────────────
-chrome.alarms.create('dailyReset', { when: nextMidnight(), periodInMinutes: 1440 })
+// ── Alarms ────────────────────────────────────────────────────────────────────
+chrome.alarms.create('keepAlive',   { periodInMinutes: 0.4  })
+chrome.alarms.create('spiralCheck', { periodInMinutes: 2    })
+chrome.alarms.create('dailyReset',  { when: nextMidnight(), periodInMinutes: 1440 })
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === 'keepAlive') { console.log('🔄 SW keepalive ping'); return }
+  if (alarm.name === 'keepAlive') {
+    console.log('🔄 SW keepalive ping')
+    return
+  }
+
+  if (alarm.name === 'spiralCheck') {
+    runSpiralCheck()
+    return
+  }
+
   if (alarm.name === 'dailyReset') {
     const data = await chrome.storage.local.get(['domainStats', 'history', 'hourlyToday'])
     const todayStats  = data.domainStats  || {}
@@ -182,6 +286,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       const keys = Object.keys(history).sort()
       while (keys.length > 7) delete history[keys.shift()]
     }
+
+    // Reset spiral state at midnight too
+    recentActivity = []
+    spiralState = { warned: false, notified: false, detectedAt: null, clearedAt: null }
 
     await chrome.storage.local.set({ domainStats: {}, history, hourlyToday: {} })
     console.log(`🌅 Daily reset — saved ${todayKey} to history`)
@@ -257,6 +365,8 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
       if (domain) await saveTimeSpent(domain, (Date.now() - currentTabState.startTime) / 1000, 1.0)
       currentTabState.startTime = null
     }
+    // Also clear spiral buffer on idle — breaks the pattern naturally
+    pruneBuffer()
   } else if (newState === 'active') {
     currentTabState.startTime = Date.now()
   }
@@ -275,24 +385,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const overrides = data.customCategories || {}
       const existing  = stats[domain]
 
-      // Never override a user-confirmed category
-      if (overrides[domain]) {
-        console.log(`[Content] ${domain} — skipped, user has override`)
-        return
-      }
+      if (overrides[domain]) return
 
       const result = scoreContent(request.signals)
-      if (!result) {
-        console.log(`[Content] ${domain} — no clear content signal`)
-        return
-      }
+      if (!result) return
 
       const domainResult = getCategory(domain, overrides)
-
-      // Only suggest if content disagrees with current domain-based category
       if (result.category === domainResult.category) {
-        console.log(`[Content] ${domain} — content agrees with domain: ${result.category}`)
-        // Still update the title for display
         if (existing) {
           stats[domain] = { ...existing, title: request.title }
           await chrome.storage.local.set({ domainStats: stats })
@@ -300,34 +399,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return
       }
 
-      // Content disagrees — store as a pending suggestion (guessed: true, source: 'content')
       if (existing) {
         stats[domain] = {
           ...existing,
           title: request.title,
           contentSuggestion: result.category,
           contentConfidence: result.confidence,
-          // If domain was already heuristic-guessed, content wins immediately
-          // If domain was a hardcoded default, content stays as suggestion (user confirms)
           category:  domainResult.source === 'heuristic' ? result.category : existing.category,
           guessed:   domainResult.source === 'heuristic' ? true : existing.guessed,
           source:    domainResult.source === 'heuristic' ? 'content' : existing.source,
         }
       } else {
-        // Domain not tracked yet — pre-populate with content suggestion
         stats[domain] = {
-          time: 0,
-          title: request.title,
-          category: result.category,
-          guessed: true,
-          source: 'content',
-          contentSuggestion: result.category,
-          contentConfidence: result.confidence,
+          time: 0, title: request.title,
+          category: result.category, guessed: true, source: 'content',
+          contentSuggestion: result.category, contentConfidence: result.confidence,
         }
       }
 
       await chrome.storage.local.set({ domainStats: stats })
-      console.log(`[Content] ${domain} — suggests "${result.category}" (${result.confidence}% confidence) via content, was "${domainResult.category}" via ${domainResult.source}`)
+      console.log(`[Content] ${domain} — suggests "${result.category}" (${result.confidence}% confidence)`)
     })
     return true
   }
@@ -341,14 +432,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       saveTimeSpent(domain, secs, 1.0).then(() => {
         currentTabState.startTime = Date.now()
         chrome.storage.local.get(['domainStats'], (data) => {
-          sendResponse({ stats: data.domainStats || {}, switchCount: switchLog.length })
+          sendResponse({
+            stats: data.domainStats || {},
+            switchCount: switchLog.length,
+            spiralWarning: spiralState.warned && !spiralState.notified
+              ? { active: true, since: spiralState.detectedAt }
+              : { active: false }
+          })
         })
       })
     } else {
       chrome.storage.local.get(['domainStats'], (data) => {
-        sendResponse({ stats: data.domainStats || {}, switchCount: switchLog.length })
+        sendResponse({
+          stats: data.domainStats || {},
+          switchCount: switchLog.length,
+          spiralWarning: spiralState.warned && !spiralState.notified
+            ? { active: true, since: spiralState.detectedAt }
+            : { active: false }
+        })
       })
     }
+    return true
+  }
+
+  // ── Dismiss spiral warning from popup ────────────────────────────────────
+  if (request.action === 'dismissSpiral') {
+    spiralState.warned    = false
+    spiralState.notified  = false
+    spiralState.detectedAt = null
+    recentActivity = []   // clear the buffer — fresh start
+    console.log('🙅 Spiral dismissed by user')
+    sendResponse({ ok: true })
     return true
   }
 })
