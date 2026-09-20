@@ -18,8 +18,7 @@ function getDomain(url) {
 
 const CAT_COLOR = { productive: '#06D6A0', neutral: '#FFD166', unproductive: '#FF6B6B' }
 const CAT_ORDER = ['productive', 'neutral', 'unproductive']
-
-const PALETTE = ['#7C6FFF', '#FF6B6B', '#FFD166', '#06D6A0', '#4CC9F0', '#F77F00', '#A8DADC']
+const PALETTE   = ['#7C6FFF', '#FF6B6B', '#FFD166', '#06D6A0', '#4CC9F0', '#F77F00', '#A8DADC']
 
 const SITE_ICONS = {
   'youtube.com': '▶', 'github.com': '⌥', 'twitter.com': '𝕏',
@@ -46,8 +45,8 @@ function computePI(sites) {
 
 function piLabel(score) {
   if (score >= 75) return { text: 'Deep focus', color: '#06D6A0' }
-  if (score >= 50) return { text: 'On track', color: '#FFD166' }
-  if (score >= 25) return { text: 'Scattered', color: '#F77F00' }
+  if (score >= 50) return { text: 'On track',   color: '#FFD166' }
+  if (score >= 25) return { text: 'Scattered',  color: '#F77F00' }
   return { text: 'Distracted', color: '#FF6B6B' }
 }
 
@@ -77,7 +76,7 @@ function DonutChart({ sites, total }) {
   let offset = 0
   const slices = sites.map((s) => {
     const dash = total > 0 ? (s.time / total) * circumference : 0
-    const gap = circumference - dash
+    const gap  = circumference - dash
     const slice = { ...s, dash, gap, offset }
     offset += dash
     return slice
@@ -106,21 +105,86 @@ function Bar({ pct, color }) {
   )
 }
 
-// ── Clickable category pill — dashed = guessed, solid = confirmed ────────────
-function CatPill({ category, guessed, onClick }) {
+// ── Category pill ─────────────────────────────────────────────────────────────
+// guessed=true → dashed + "?" suffix
+// source='content' → shows a small ◈ dot to indicate content-aware origin
+function CatPill({ category, guessed, source, onClick }) {
   const color = CAT_COLOR[category] || '#9a9ab0'
   const labels = { productive: 'P', neutral: 'N', unproductive: 'U' }
+  const isContent = source === 'content'
+  const title = isContent
+    ? `Content-aware suggestion — click to confirm or change`
+    : guessed
+    ? `Guessed from domain name — click to confirm or change`
+    : `Click to recategorize`
+
   return (
-    <button
-      onClick={onClick}
-      title={guessed ? 'Guessed — click to confirm or change' : 'Click to recategorize'}
+    <button onClick={onClick} title={title}
       style={{
         fontSize: 9, fontWeight: 700, color,
         border: `1px ${guessed ? 'dashed' : 'solid'} ${color}${guessed ? '99' : '55'}`,
-        borderRadius: 4,
-        padding: '1px 4px', letterSpacing: '0.04em', flexShrink: 0,
+        borderRadius: 4, padding: '1px 4px', letterSpacing: '0.04em', flexShrink: 0,
         background: 'none', cursor: 'pointer', fontFamily: 'inherit',
-      }}>{labels[category] || '?'}{guessed ? '?' : ''}</button>
+        display: 'flex', alignItems: 'center', gap: 2,
+      }}>
+      {isContent && <span style={{ fontSize: 8, opacity: 0.8 }}>◈</span>}
+      {labels[category] || '?'}{guessed ? '?' : ''}
+    </button>
+  )
+}
+
+// ── Site row ──────────────────────────────────────────────────────────────────
+function SiteRow({ site, total, onCycle, isLast }) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div>
+      <div
+        style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '6px 0',
+          borderBottom: isLast && !expanded ? 'none' : '1px solid #1a1a2a',
+          cursor: site.title ? 'pointer' : 'default',
+        }}
+        onClick={() => site.title && setExpanded(e => !e)}
+      >
+        <div style={{
+          width: 26, height: 26, borderRadius: 6, background: '#1e1e2e',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 10, fontWeight: 700, flexShrink: 0,
+          color: site.color, border: `1px solid ${site.color}33`
+        }}>
+          {siteIcon(site.domain)}
+        </div>
+        <span style={{ flex: 1, fontSize: 12, color: '#c5c5d8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {site.domain}
+        </span>
+        <CatPill
+          category={site.category}
+          guessed={site.guessed}
+          source={site.source}
+          onClick={(e) => { e.stopPropagation(); onCycle() }}
+        />
+        <Bar pct={total > 0 ? site.time / total : 0} color={site.color} />
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#fff', minWidth: 36, textAlign: 'right' }}>
+          {fmt(site.time)}
+        </span>
+      </div>
+
+      {/* Expanded title row — shown when content script captured a page title */}
+      {expanded && site.title && (
+        <div style={{
+          fontSize: 10, color: '#6b6b85', padding: '4px 34px 8px',
+          borderBottom: isLast ? 'none' : '1px solid #1a1a2a',
+          lineHeight: 1.5,
+        }}>
+          {site.source === 'content' && (
+            <span style={{ color: '#7C6FFF', marginRight: 4 }}>◈ content-aware</span>
+          )}
+          "{site.title}"
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -136,10 +200,14 @@ export default function Popup() {
     const processStats = (raw, switchCount = 0) => {
       const entries = Object.entries(raw)
         .map(([domain, val]) => ({
-          domain: getDomain(domain),
-          time:     typeof val === 'object' ? val.time     : val,
-          category: typeof val === 'object' ? val.category : 'neutral',
+          domain:   getDomain(domain),
+          time:     typeof val === 'object' ? (val.time     || 0) : val,
+          category: typeof val === 'object' ? (val.category || 'neutral') : 'neutral',
           guessed:  typeof val === 'object' ? !!val.guessed : false,
+          source:   typeof val === 'object' ? (val.source   || 'domain') : 'domain',
+          title:    typeof val === 'object' ? (val.title    || null) : null,
+          contentSuggestion: typeof val === 'object' ? (val.contentSuggestion || null) : null,
+          contentConfidence: typeof val === 'object' ? (val.contentConfidence || null) : null,
         }))
         .filter(x => x.time > 0)
         .sort((a, b) => b.time - a.time)
@@ -163,12 +231,12 @@ export default function Popup() {
       })
     } else {
       processStats({
-        'github.com':        { time: 5400, category: 'productive',   guessed: false },
-        'youtube.com':       { time: 3200, category: 'unproductive', guessed: false },
-        'leetcode.com':      { time: 1800, category: 'productive',   guessed: true  },
-        'twitter.com':       { time: 900,  category: 'unproductive', guessed: false },
-        'google.com':        { time: 600,  category: 'neutral',      guessed: false },
-        'randomblog.io':     { time: 400,  category: 'neutral',      guessed: true  },
+        'github.com':    { time: 5400, category: 'productive',   guessed: false, source: 'domain',    title: null },
+        'medium.com':    { time: 3200, category: 'unproductive', guessed: true,  source: 'content',   title: 'Top 10 Netflix Shows You Must Watch', contentSuggestion: 'unproductive', contentConfidence: 82 },
+        'medium.com/2':  { time: 1800, category: 'productive',   guessed: true,  source: 'content',   title: 'Building a React App from Scratch', contentSuggestion: 'productive',   contentConfidence: 76 },
+        'twitter.com':   { time: 900,  category: 'unproductive', guessed: false, source: 'domain',    title: null },
+        'google.com':    { time: 600,  category: 'neutral',      guessed: false, source: 'domain',    title: null },
+        'newsite.io':    { time: 400,  category: 'productive',   guessed: true,  source: 'heuristic', title: null },
       }, 4)
     }
   }, [])
@@ -184,28 +252,15 @@ export default function Popup() {
     }
   }
 
-  const openHistory = () => {
-    if (typeof chrome !== 'undefined' && chrome.tabs) {
-      chrome.tabs.create({ url: chrome.runtime.getURL('history.html') })
-    }
-  }
+  const openHistory  = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }) }
+  const openSettings = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') }) }
 
-  const openSettings = () => {
-    if (typeof chrome !== 'undefined' && chrome.tabs) {
-      chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') })
-    }
-  }
-
-  // Click a pill → cycle category → save override → patch today's stats → update UI
-  // Also flips guessed → false, since a click always means "this is confirmed now"
   const cycleCategory = async (domain, currentCat) => {
     const next = CAT_ORDER[(CAT_ORDER.indexOf(currentCat) + 1) % CAT_ORDER.length]
 
     if (typeof chrome === 'undefined' || !chrome.storage) {
-      const updated = sites.map(s => s.domain === domain ? { ...s, category: next, guessed: false } : s)
-      setSites(updated)
-      setPI(computePI(updated))
-      return
+      const updated = sites.map(s => s.domain === domain ? { ...s, category: next, guessed: false, source: 'user' } : s)
+      setSites(updated); setPI(computePI(updated)); return
     }
 
     const { customCategories = {} } = await chrome.storage.local.get(['customCategories'])
@@ -214,57 +269,42 @@ export default function Popup() {
 
     const { domainStats = {} } = await chrome.storage.local.get(['domainStats'])
     if (domainStats[domain]) {
-      domainStats[domain] = { ...domainStats[domain], category: next, guessed: false }
+      domainStats[domain] = { ...domainStats[domain], category: next, guessed: false, source: 'user' }
       await chrome.storage.local.set({ domainStats })
     }
 
     setSites(prev => {
-      const updated = prev.map(s => s.domain === domain ? { ...s, category: next, guessed: false } : s)
+      const updated = prev.map(s => s.domain === domain ? { ...s, category: next, guessed: false, source: 'user' } : s)
       setPI(computePI(updated))
       return updated
     })
   }
 
   const s = {
-    root: {
-      width: 360, minHeight: 500,
-      background: '#13131f', color: '#fff',
-      fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
-      fontSize: 13, padding: '14px 16px 18px', boxSizing: 'border-box', userSelect: 'none',
-    },
+    root: { width: 360, minHeight: 500, background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", fontSize: 13, padding: '14px 16px 18px', boxSizing: 'border-box', userSelect: 'none' },
     header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
-    logo:   { display: 'flex', alignItems: 'center', gap: 8 },
-    logoDot:{ width: 8, height: 8, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 8px #7C6FFF' },
+    logo:    { display: 'flex', alignItems: 'center', gap: 8 },
+    logoDot: { width: 8, height: 8, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 8px #7C6FFF' },
     logoText:{ fontSize: 14, fontWeight: 700, color: '#fff', letterSpacing: '0.03em' },
     headerRight: { display: 'flex', alignItems: 'center', gap: 8 },
-    pill:   { fontSize: 10, fontWeight: 700, background: '#1e1e2e', color: '#7C6FFF', padding: '3px 10px', borderRadius: 20, border: '1px solid #2e2e45' },
-    gearBtn:{ background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 13, padding: '3px 7px', cursor: 'pointer' },
-
+    pill:    { fontSize: 10, fontWeight: 700, background: '#1e1e2e', color: '#7C6FFF', padding: '3px 10px', borderRadius: 20, border: '1px solid #2e2e45' },
+    gearBtn: { background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 13, padding: '3px 7px', cursor: 'pointer' },
     topRow:  { display: 'flex', gap: 12, marginBottom: 14, alignItems: 'center' },
     rightCol:{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 },
-
     piCard:  { background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 10, padding: '8px 12px', display: 'flex', alignItems: 'center', gap: 10 },
     piLabel: { fontSize: 10, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 },
     piScore: { fontSize: 18, fontWeight: 700 },
     piDesc:  { fontSize: 11, marginTop: 1 },
-
     statRow: { display: 'flex', gap: 8 },
     statBox: { flex: 1, background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 10, padding: '7px 10px' },
     statLabel:{ fontSize: 9, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 },
     statVal:  { fontSize: 15, fontWeight: 700, color: '#fff' },
-
-    divider:      { height: 1, background: '#1e1e2e', margin: '0 0 12px' },
-    sectionTitle: { fontSize: 9, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8, display: 'flex', justifyContent: 'space-between' },
-    hint: { fontSize: 9, color: '#4a4a5e', fontStyle: 'italic' },
-
-    siteRow: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid #1a1a2a' },
-    avatar:  { width: 26, height: 26, borderRadius: 6, background: '#1e1e2e', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, fontWeight: 700, flexShrink: 0 },
-    siteName:{ flex: 1, fontSize: 12, color: '#c5c5d8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-    siteTime:{ fontSize: 12, fontWeight: 600, color: '#fff', minWidth: 36, textAlign: 'right' },
-
-    center: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 320, gap: 10, textAlign: 'center' },
-    footer: { marginTop: 14, display: 'flex', justifyContent: 'center', gap: 8 },
-    clearBtn:{ fontSize: 11, color: '#6b6b85', background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 14px', cursor: 'pointer' },
+    divider:  { height: 1, background: '#1e1e2e', margin: '0 0 12px' },
+    sectionTitle: { display: 'flex', justifyContent: 'space-between', fontSize: 9, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 },
+    hint:     { fontSize: 9, color: '#4a4a5e', fontStyle: 'italic' },
+    center:   { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 320, gap: 10, textAlign: 'center' },
+    footer:   { marginTop: 14, display: 'flex', justifyContent: 'center', gap: 8 },
+    clearBtn: { fontSize: 11, color: '#6b6b85', background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 14px', cursor: 'pointer' },
   }
 
   return (
@@ -310,16 +350,17 @@ export default function Popup() {
 
         <div style={s.sectionTitle}>
           <span>Top destinations</span>
-          <span style={s.hint}>dashed "?" = guessed, click to confirm</span>
+          <span style={s.hint}>◈ = content-aware · dashed = unconfirmed</span>
         </div>
+
         {sites.map((site, i) => (
-          <div key={site.domain} style={{...s.siteRow, borderBottom: i===sites.length-1?'none':s.siteRow.borderBottom}}>
-            <div style={{...s.avatar, color:site.color, border:`1px solid ${site.color}33`}}>{siteIcon(site.domain)}</div>
-            <span style={s.siteName}>{site.domain}</span>
-            <CatPill category={site.category} guessed={site.guessed} onClick={() => cycleCategory(site.domain, site.category)} />
-            <Bar pct={total>0?site.time/total:0} color={site.color} />
-            <span style={s.siteTime}>{fmt(site.time)}</span>
-          </div>
+          <SiteRow
+            key={site.domain}
+            site={site}
+            total={total}
+            isLast={i === sites.length - 1}
+            onCycle={() => cycleCategory(site.domain, site.category)}
+          />
         ))}
 
         <div style={s.footer}>

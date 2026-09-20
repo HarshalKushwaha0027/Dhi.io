@@ -13,6 +13,9 @@ if (fs.existsSync('public/icon16.png')) {
   pairs.push(['public/icon16.png', 'dist/icon16.png'])
 }
 
+fs.copyFileSync('public/content.js', 'dist/content.js')
+console.log('✅ content.js → dist/content.js')
+
 for (const [src, dest] of pairs) {
   const from = path.resolve(__dirname, '..', src)
   const to   = path.resolve(__dirname, '..', dest)
