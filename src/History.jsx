@@ -53,12 +53,10 @@ function piLabel(score) {
   return 'Distracted'
 }
 
-// ── Fold every stored day's hourly data + today's live hourly data ───────────
-// into 24 buckets of { productive, neutral, unproductive } seconds.
+// ── Hourly aggregation ────────────────────────────────────────────────────────
 function aggregateHourly(history, hourlyToday) {
   const buckets = {}
   for (let h = 0; h < 24; h++) buckets[h] = { productive: 0, neutral: 0, unproductive: 0 }
-
   const foldIn = (hourlyObj) => {
     Object.entries(hourlyObj || {}).forEach(([hourStr, catTimes]) => {
       const h = Number(hourStr)
@@ -68,15 +66,11 @@ function aggregateHourly(history, hourlyToday) {
       buckets[h].unproductive += catTimes?.unproductive || 0
     })
   }
-
   Object.values(history || {}).forEach(dayEntry => foldIn(dayEntry?.hourly))
   foldIn(hourlyToday)
-
   return buckets
 }
 
-// Minimum aggregated seconds in an hour bucket before we trust its PI —
-// avoids one stray 61-second visit at 3am skewing the forecast.
 const MIN_SAMPLE_SECONDS = 120
 
 function computeHourlyPI(buckets) {
@@ -90,10 +84,162 @@ function computeHourlyPI(buckets) {
   })
 }
 
+// ── AI digest — builds an aggregated-only data summary and calls Gemini ──────
+// Only scores, categories, site names, and durations are sent. No URLs.
+// Uses Gemini's free tier (gemini-3.1-flash-lite — stable, not deprecated).
+async function generateDigest(days, hourlyPIArr, apiKey) {
+  const withData = days.filter(d => d.totalTime > 0)
+  if (withData.length === 0) throw new Error('No data to summarize yet')
+
+  const avgPI = Math.round(withData.reduce((s, d) => s + d.pi, 0) / withData.length)
+  const best  = withData.reduce((a, b) => a.pi > b.pi ? a : b)
+  const worst = withData.reduce((a, b) => a.pi < b.pi ? a : b)
+  const totalTime = withData.reduce((s, d) => s + d.totalTime, 0)
+
+  const merged = {}
+  withData.forEach(day => {
+    Object.entries(day.domainStats || {}).forEach(([domain, val]) => {
+      if (!merged[domain]) merged[domain] = { time: 0, category: val?.category || 'neutral' }
+      merged[domain].time += val?.time || 0
+    })
+  })
+  const topSites = Object.entries(merged)
+    .sort(([, a], [, b]) => b.time - a.time)
+    .slice(0, 5)
+    .map(([d, v]) => `${d} (${v.category}, ${fmt(v.time)})`)
+
+  const withHourData = hourlyPIArr.filter(h => h.pi !== null)
+  const bestHour  = withHourData.length ? withHourData.reduce((a, b) => a.pi > b.pi ? a : b) : null
+  const worstHour = withHourData.length ? withHourData.reduce((a, b) => a.pi < b.pi ? a : b) : null
+
+  const dataSummary = [
+    `Weekly average Productivity Index: ${avgPI}/100`,
+    `Total screen time this week: ${fmt(totalTime)}`,
+    `Best day: ${dayLabel(best.key)} (PI ${best.pi}, ${fmt(best.totalTime)})`,
+    `Worst day: ${dayLabel(worst.key)} (PI ${worst.pi}, ${fmt(worst.totalTime)})`,
+    `Top sites: ${topSites.join(', ')}`,
+    bestHour  ? `Best focus hour: ${hourLabel(bestHour.hour)} (avg PI ${bestHour.pi})` : '',
+    worstHour ? `Worst focus hour: ${hourLabel(worstHour.hour)} (avg PI ${worstHour.pi})` : '',
+  ].filter(Boolean).join('\n')
+
+  const prompt = `You are writing a short, warm, specific weekly focus summary for someone using a productivity tracking browser extension called Dhi. Here is their real data for this week:
+
+${dataSummary}
+
+Write a 3-4 sentence plain-English summary of their week. Be specific and reference the actual numbers, days, and sites above. Point out one clear win and one area to watch. End with one light, actionable suggestion for next week. Do not use bullet points, headers, or markdown — just flowing prose. Keep a warm, encouraging tone, not clinical or preachy.`
+
+  const model = 'gemini-3.1-flash-lite'
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 300, temperature: 0.7 },
+    }),
+  })
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err?.error?.message || `API error ${response.status}`)
+  }
+
+  const data = await response.json()
+  const text = (data.candidates?.[0]?.content?.parts || [])
+    .map(p => p.text || '')
+    .join('')
+    .trim()
+  if (!text) throw new Error('Empty response from API — the free tier may be rate-limited, try again shortly')
+  return text
+}
+
+// ── AI Digest card ────────────────────────────────────────────────────────────
+function AIDigest({ days, hourlyPIArr }) {
+  const [apiKey, setApiKey]   = useState(null)
+  const [digest, setDigest]   = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError]     = useState(null)
+  const isExt = typeof chrome !== 'undefined' && chrome.storage
+
+  useEffect(() => {
+    if (isExt) {
+      chrome.storage.local.get(['geminiApiKey', 'aiDigest'], (data) => {
+        setApiKey(data.geminiApiKey || null)
+        if (data.aiDigest) setDigest(data.aiDigest)
+      })
+    }
+  }, [])
+
+  const generate = async () => {
+    if (!apiKey) return
+    setLoading(true)
+    setError(null)
+    try {
+      const text = await generateDigest(days, hourlyPIArr, apiKey)
+      const entry = { text, generatedAt: Date.now() }
+      setDigest(entry)
+      if (isExt) chrome.storage.local.set({ aiDigest: entry })
+    } catch (e) {
+      setError(e.message || 'Failed to generate digest')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const openSettings = () => {
+    if (typeof chrome !== 'undefined' && chrome.tabs) {
+      chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') })
+    }
+  }
+
+  const s = {
+    card:  { background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 10, padding: '16px 18px' },
+    text:  { fontSize: 13, color: '#c5c5d8', lineHeight: 1.7 },
+    btn:   { background: '#7C6FFF', color: '#fff', border: 'none', borderRadius: 6, padding: '8px 16px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' },
+    btnOutline: { background: 'none', color: '#9a9ab0', border: '1px solid #2a2a3e', borderRadius: 6, padding: '8px 16px', fontSize: 12, cursor: 'pointer', fontFamily: 'inherit' },
+    meta:  { fontSize: 10, color: '#6b6b85', marginTop: 10 },
+    noKey: { fontSize: 12, color: '#6b6b85', lineHeight: 1.6, marginBottom: 12 },
+    error: { fontSize: 12, color: '#FF6B6B', marginBottom: 10 },
+    row:   { display: 'flex', gap: 8, marginTop: 12 },
+  }
+
+  if (!apiKey) {
+    return (
+      <div style={s.card}>
+        <div style={s.noKey}>
+          Add your free Google Gemini API key in Settings to get a written summary of your week, in your own extension, using your own key.
+        </div>
+        <button style={s.btn} onClick={openSettings}>Open Settings</button>
+      </div>
+    )
+  }
+
+  return (
+    <div style={s.card}>
+      {error && <div style={s.error}>⚠️ {error}</div>}
+      {loading && <div style={s.text}>Writing your weekly summary...</div>}
+      {!loading && digest && (
+        <>
+          <div style={s.text}>{digest.text}</div>
+          <div style={s.meta}>Generated {new Date(digest.generatedAt).toLocaleString()}</div>
+        </>
+      )}
+      {!loading && !digest && !error && (
+        <div style={s.text}>Click below to have Claude write a plain-English summary of your week.</div>
+      )}
+      <div style={s.row}>
+        <button style={s.btn} onClick={generate} disabled={loading}>
+          {digest ? 'Regenerate' : 'Generate AI digest'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // ── Focus Forecast — hourly bar chart + best/worst callout ───────────────────
 function FocusForecast({ hourlyPIArr }) {
   const withData = hourlyPIArr.filter(h => h.pi !== null)
-
   if (withData.length === 0) {
     return (
       <div style={{ fontSize: 12, color: '#6b6b85', padding: '20px 0', textAlign: 'center', lineHeight: 1.6 }}>
@@ -101,7 +247,6 @@ function FocusForecast({ hourlyPIArr }) {
       </div>
     )
   }
-
   const best  = withData.reduce((a, b) => a.pi > b.pi ? a : b)
   const worst = withData.reduce((a, b) => a.pi < b.pi ? a : b)
 
@@ -118,7 +263,6 @@ function FocusForecast({ hourlyPIArr }) {
         Your focus peaks around <strong style={{ color: '#06D6A0' }}>{hourLabel(best.hour)}</strong> (avg PI {best.pi})
         {best.hour !== worst.hour && <> · dips around <strong style={{ color: '#FF6B6B' }}>{hourLabel(worst.hour)}</strong> (avg PI {worst.pi})</>}
       </div>
-
       <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
         {[0, 25, 50, 75, 100].map(v => {
           const y = PAD.top + chartH * (1 - v / 100)
@@ -129,15 +273,12 @@ function FocusForecast({ hourlyPIArr }) {
             </g>
           )
         })}
-
         {hourlyPIArr.map((h, i) => {
           const x = PAD.left + i * slot + 1
-          if (h.pi === null) {
-            return <rect key={i} x={x} y={PAD.top + chartH - 3} width={barW} height={3} rx={1} fill="#1e1e2e" />
-          }
+          if (h.pi === null) return <rect key={i} x={x} y={PAD.top + chartH - 3} width={barW} height={3} rx={1} fill="#1e1e2e" />
           const barH = Math.max(2, (h.pi / 100) * chartH)
           const color = piColor(h.pi)
-          const isBest  = h.hour === best.hour
+          const isBest = h.hour === best.hour
           const isWorst = h.hour === worst.hour
           return (
             <rect key={i} x={x} y={PAD.top + chartH - barH} width={barW} height={barH} rx={2}
@@ -146,12 +287,9 @@ function FocusForecast({ hourlyPIArr }) {
               strokeWidth={isBest || isWorst ? 1.5 : 0} />
           )
         })}
-
         {[0, 6, 12, 18, 23].map(h => (
           <text key={h} x={PAD.left + h * slot + slot / 2} y={H - 8}
-            textAnchor="middle" fill="#6b6b85" fontSize="9" fontFamily="monospace">
-            {hourLabel(h)}
-          </text>
+            textAnchor="middle" fill="#6b6b85" fontSize="9" fontFamily="monospace">{hourLabel(h)}</text>
         ))}
       </svg>
     </div>
@@ -160,12 +298,10 @@ function FocusForecast({ hourlyPIArr }) {
 
 // ── Stacked Bar Chart (daily) ─────────────────────────────────────────────────
 function WeeklyChart({ days }) {
-  const W = 640
-  const H = 260
+  const W = 640, H = 260
   const PAD = { top: 20, bottom: 40, left: 48, right: 20 }
   const chartW = W - PAD.left - PAD.right
   const chartH = H - PAD.top - PAD.bottom
-
   const maxTime = Math.max(...days.map(d => d.totalTime), 1)
   const barW = Math.floor(chartW / 7) - 8
   const gap  = Math.floor(chartW / 7)
@@ -176,56 +312,28 @@ function WeeklyChart({ days }) {
         const y = PAD.top + chartH * (1 - pct)
         return (
           <g key={i}>
-            <line x1={PAD.left} x2={W - PAD.right} y1={y} y2={y}
-              stroke="#1e1e2e" strokeWidth="1" />
-            <text x={PAD.left - 6} y={y + 4} textAnchor="end"
-              fill="#6b6b85" fontSize="10" fontFamily="monospace">
-              {fmt(maxTime * pct)}
-            </text>
+            <line x1={PAD.left} x2={W - PAD.right} y1={y} y2={y} stroke="#1e1e2e" strokeWidth="1" />
+            <text x={PAD.left - 6} y={y + 4} textAnchor="end" fill="#6b6b85" fontSize="10" fontFamily="monospace">{fmt(maxTime * pct)}</text>
           </g>
         )
       })}
-
       {days.map((day, i) => {
         const x = PAD.left + i * gap + (gap - barW) / 2
         const totalH = maxTime > 0 ? (day.totalTime / maxTime) * chartH : 0
-
         const prod    = day.productiveTime / maxTime * chartH
         const neutral = day.neutralTime   / maxTime * chartH
         const unprod  = day.unproductiveTime / maxTime * chartH
-
         const isToday = day.key === dateKey(0)
-
         return (
           <g key={day.key}>
-            {unprod > 0 && (
-              <rect x={x} y={PAD.top + chartH - unprod}
-                width={barW} height={unprod} fill="#FF6B6B" opacity="0.85" />
-            )}
-            {neutral > 0 && (
-              <rect x={x} y={PAD.top + chartH - unprod - neutral}
-                width={barW} height={neutral} fill="#FFD166" opacity="0.85" />
-            )}
-            {prod > 0 && (
-              <rect x={x} y={PAD.top + chartH - unprod - neutral - prod}
-                width={barW} height={prod} rx="3" fill="#06D6A0" opacity="0.85" />
-            )}
-            {day.totalTime === 0 && (
-              <rect x={x} y={PAD.top + chartH - 4}
-                width={barW} height={4} rx="2" fill="#1e1e2e" />
-            )}
+            {unprod > 0 && <rect x={x} y={PAD.top + chartH - unprod} width={barW} height={unprod} fill="#FF6B6B" opacity="0.85" />}
+            {neutral > 0 && <rect x={x} y={PAD.top + chartH - unprod - neutral} width={barW} height={neutral} fill="#FFD166" opacity="0.85" />}
+            {prod > 0 && <rect x={x} y={PAD.top + chartH - unprod - neutral - prod} width={barW} height={prod} rx="3" fill="#06D6A0" opacity="0.85" />}
+            {day.totalTime === 0 && <rect x={x} y={PAD.top + chartH - 4} width={barW} height={4} rx="2" fill="#1e1e2e" />}
             {day.totalTime > 0 && (
-              <text x={x + barW / 2} y={PAD.top + chartH - totalH - 6}
-                textAnchor="middle" fill={piColor(day.pi)}
-                fontSize="10" fontWeight="700" fontFamily="monospace">
-                {day.pi}
-              </text>
+              <text x={x + barW / 2} y={PAD.top + chartH - totalH - 6} textAnchor="middle" fill={piColor(day.pi)} fontSize="10" fontWeight="700" fontFamily="monospace">{day.pi}</text>
             )}
-            <text x={x + barW / 2} y={H - 8}
-              textAnchor="middle"
-              fill={isToday ? '#7C6FFF' : '#6b6b85'}
-              fontSize="11" fontWeight={isToday ? '700' : '400'}
-              fontFamily="monospace">
+            <text x={x + barW / 2} y={H - 8} textAnchor="middle" fill={isToday ? '#7C6FFF' : '#6b6b85'} fontSize="11" fontWeight={isToday ? '700' : '400'} fontFamily="monospace">
               {isToday ? 'Today' : dayLabel(day.key)}
             </text>
           </g>
@@ -237,36 +345,21 @@ function WeeklyChart({ days }) {
 
 // ── PI trend sparkline ────────────────────────────────────────────────────────
 function PISparkline({ days }) {
-  const W = 640
-  const H = 60
-  const PAD = 20
+  const W = 640, H = 60, PAD = 20
   const chartW = W - PAD * 2
   const chartH = H - PAD
-
   const points = days.map((d, i) => {
     const x = PAD + (i / 6) * chartW
     const y = PAD + (1 - d.pi / 100) * (chartH - PAD / 2)
     return [x, y]
   })
-
-  const path = points.map((p, i) =>
-    (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ',' + p[1].toFixed(1)
-  ).join(' ')
+  const path = points.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ')
 
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
-      <line x1={PAD} x2={W - PAD}
-        y1={PAD + (chartH - PAD / 2) * 0.5}
-        y2={PAD + (chartH - PAD / 2) * 0.5}
-        stroke="#2a2a3e" strokeWidth="1" strokeDasharray="4 3" />
-
-      <path d={path} fill="none" stroke="#7C6FFF" strokeWidth="2"
-        strokeLinecap="round" strokeLinejoin="round" />
-
-      {points.map(([x, y], i) => (
-        <circle key={i} cx={x} cy={y} r="3"
-          fill={piColor(days[i].pi)} stroke="#13131f" strokeWidth="1.5" />
-      ))}
+      <line x1={PAD} x2={W - PAD} y1={PAD + (chartH - PAD / 2) * 0.5} y2={PAD + (chartH - PAD / 2) * 0.5} stroke="#2a2a3e" strokeWidth="1" strokeDasharray="4 3" />
+      <path d={path} fill="none" stroke="#7C6FFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      {points.map(([x, y], i) => <circle key={i} cx={x} cy={y} r="3" fill={piColor(days[i].pi)} stroke="#13131f" strokeWidth="1.5" />)}
     </svg>
   )
 }
@@ -275,7 +368,6 @@ function PISparkline({ days }) {
 function SummaryCards({ days }) {
   const withData = days.filter(d => d.totalTime > 0)
   if (withData.length === 0) return null
-
   const best  = withData.reduce((a, b) => a.pi > b.pi ? a : b)
   const worst = withData.reduce((a, b) => a.pi < b.pi ? a : b)
   const avgPI = Math.round(withData.reduce((s, d) => s + d.pi, 0) / withData.length)
@@ -291,26 +383,10 @@ function SummaryCards({ days }) {
 
   return (
     <div style={s.grid}>
-      <div style={s.card}>
-        <div style={s.label}>Weekly avg PI</div>
-        <div style={{...s.val, color: piColor(avgPI)}}>{avgPI}</div>
-        <div style={s.sub}>{piLabel(avgPI)}</div>
-      </div>
-      <div style={s.card}>
-        <div style={s.label}>Total screen time</div>
-        <div style={s.val}>{fmt(totalWeekTime)}</div>
-        <div style={s.sub}>across {withData.length} days</div>
-      </div>
-      <div style={s.card}>
-        <div style={s.label}>Best day</div>
-        <div style={{...s.val, color: '#06D6A0'}}>{best.pi}</div>
-        <div style={s.sub}>{dayLabel(best.key)} · {fmt(best.totalTime)}</div>
-      </div>
-      <div style={s.card}>
-        <div style={s.label}>Worst day</div>
-        <div style={{...s.val, color: '#FF6B6B'}}>{worst.pi}</div>
-        <div style={s.sub}>{dayLabel(worst.key)} · {fmt(worst.totalTime)}</div>
-      </div>
+      <div style={s.card}><div style={s.label}>Weekly avg PI</div><div style={{...s.val, color: piColor(avgPI)}}>{avgPI}</div><div style={s.sub}>{piLabel(avgPI)}</div></div>
+      <div style={s.card}><div style={s.label}>Total screen time</div><div style={s.val}>{fmt(totalWeekTime)}</div><div style={s.sub}>across {withData.length} days</div></div>
+      <div style={s.card}><div style={s.label}>Best day</div><div style={{...s.val, color: '#06D6A0'}}>{best.pi}</div><div style={s.sub}>{dayLabel(best.key)} · {fmt(best.totalTime)}</div></div>
+      <div style={s.card}><div style={s.label}>Worst day</div><div style={{...s.val, color: '#FF6B6B'}}>{worst.pi}</div><div style={s.sub}>{dayLabel(worst.key)} · {fmt(worst.totalTime)}</div></div>
     </div>
   )
 }
@@ -324,29 +400,16 @@ function TopSitesWeek({ days }) {
       merged[domain].time += val?.time || 0
     })
   })
-
   const CAT_COLOR = { productive: '#06D6A0', neutral: '#FFD166', unproductive: '#FF6B6B' }
-  const sorted = Object.entries(merged)
-    .sort(([, a], [, b]) => b.time - a.time)
-    .slice(0, 6)
-
+  const sorted = Object.entries(merged).sort(([, a], [, b]) => b.time - a.time).slice(0, 6)
   const maxTime = sorted[0]?.[1].time || 1
 
   const s = {
     row:  { display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: '1px solid #1a1a2a' },
     name: { flex: 1, fontSize: 13, color: '#c5c5d8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
     time: { fontSize: 12, fontWeight: 600, color: '#fff', minWidth: 52, textAlign: 'right' },
-    pill: (cat) => ({
-      fontSize: 9, fontWeight: 700,
-      color: CAT_COLOR[cat] || '#9a9ab0',
-      border: `1px solid ${CAT_COLOR[cat] || '#9a9ab0'}55`,
-      borderRadius: 4, padding: '1px 5px',
-    }),
-    bar: (pct, color) => ({
-      height: 3, width: `${pct * 100}%`,
-      background: color, borderRadius: 2,
-      transition: 'width 0.6s ease',
-    }),
+    pill: (cat) => ({ fontSize: 9, fontWeight: 700, color: CAT_COLOR[cat] || '#9a9ab0', border: `1px solid ${CAT_COLOR[cat] || '#9a9ab0'}55`, borderRadius: 4, padding: '1px 5px' }),
+    bar: (pct, color) => ({ height: 3, width: `${pct * 100}%`, background: color, borderRadius: 2, transition: 'width 0.6s ease' }),
     barTrack: { height: 3, background: '#1e1e2e', borderRadius: 2, overflow: 'hidden', flex: 1 },
   }
 
@@ -356,9 +419,7 @@ function TopSitesWeek({ days }) {
         <div key={domain} style={{...s.row, borderBottom: i === sorted.length - 1 ? 'none' : s.row.borderBottom}}>
           <span style={s.name}>{domain}</span>
           <span style={s.pill(val.category)}>{val.category[0].toUpperCase()}</span>
-          <div style={s.barTrack}>
-            <div style={s.bar(val.time / maxTime, CAT_COLOR[val.category] || '#7C6FFF')} />
-          </div>
+          <div style={s.barTrack}><div style={s.bar(val.time / maxTime, CAT_COLOR[val.category] || '#7C6FFF')} /></div>
           <span style={s.time}>{fmt(val.time)}</span>
         </div>
       ))}
@@ -368,9 +429,9 @@ function TopSitesWeek({ days }) {
 
 // ── Main History page ─────────────────────────────────────────────────────────
 export default function History() {
-  const [days, setDays]         = useState([])
+  const [days, setDays]               = useState([])
   const [hourlyPIArr, setHourlyPIArr] = useState([])
-  const [status, setStatus]     = useState('loading')
+  const [status, setStatus]           = useState('loading')
 
   useEffect(() => {
     const load = () => {
@@ -379,7 +440,6 @@ export default function History() {
           buildDays(data.domainStats || {}, data.history || {}, data.hourlyToday || {})
         })
       } else {
-        // Dev fallback — includes mock hourly patterns too
         const mockHourly = {
           9:  { productive: 2400, neutral: 300,  unproductive: 200 },
           10: { productive: 2800, neutral: 200,  unproductive: 100 },
@@ -405,31 +465,20 @@ export default function History() {
 
     const buildDays = (todayStats, history, hourlyToday) => {
       const result = []
-
       for (let i = 6; i >= 0; i--) {
         const key = dateKey(i)
         const isToday = i === 0
         const stats = isToday ? todayStats : (history[key]?.domainStats || {})
-
         const entries = Object.values(stats)
         const totalTime = entries.reduce((s, x) => s + (x?.time || 0), 0)
-
         const productiveTime   = entries.filter(x => x?.category === 'productive').reduce((s, x) => s + x.time, 0)
         const neutralTime      = entries.filter(x => x?.category === 'neutral').reduce((s, x) => s + x.time, 0)
         const unproductiveTime = entries.filter(x => x?.category === 'unproductive').reduce((s, x) => s + x.time, 0)
-
-        result.push({
-          key, isToday, domainStats: stats, totalTime,
-          productiveTime, neutralTime, unproductiveTime,
-          pi: computePI(stats),
-        })
+        result.push({ key, isToday, domainStats: stats, totalTime, productiveTime, neutralTime, unproductiveTime, pi: computePI(stats) })
       }
-
       const hourlyBuckets = aggregateHourly(history, hourlyToday)
-      const hourlyPI = computeHourlyPI(hourlyBuckets)
-
       setDays(result)
-      setHourlyPIArr(hourlyPI)
+      setHourlyPIArr(computeHourlyPI(hourlyBuckets))
       setStatus('ok')
     }
 
@@ -437,12 +486,7 @@ export default function History() {
   }, [])
 
   const s = {
-    root: {
-      minHeight: '100vh', background: '#13131f', color: '#fff',
-      fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
-      padding: '28px 36px 48px', boxSizing: 'border-box',
-      maxWidth: 760, margin: '0 auto',
-    },
+    root: { minHeight: '100vh', background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", padding: '28px 36px 48px', boxSizing: 'border-box', maxWidth: 760, margin: '0 auto' },
     header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 },
     logo:   { display: 'flex', alignItems: 'center', gap: 10 },
     dot:    { width: 10, height: 10, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 10px #7C6FFF' },
@@ -458,11 +502,7 @@ export default function History() {
   }
 
   if (status === 'loading') {
-    return (
-      <div style={s.root}>
-        <div style={s.center}><div style={{fontSize:36}}>⏳</div><div style={{color:'#9a9ab0'}}>Loading history...</div></div>
-      </div>
-    )
+    return <div style={s.root}><div style={s.center}><div style={{fontSize:36}}>⏳</div><div style={{color:'#9a9ab0'}}>Loading history...</div></div></div>
   }
 
   const hasAnyData = days.some(d => d.totalTime > 0)
@@ -471,10 +511,7 @@ export default function History() {
     <div style={s.root}>
       <div style={s.header}>
         <div>
-          <div style={s.logo}>
-            <div style={s.dot} />
-            <span style={s.title}>Dhi.io — Weekly Report</span>
-          </div>
+          <div style={s.logo}><div style={s.dot} /><span style={s.title}>Dhi.io — Weekly Report</span></div>
           <div style={s.sub}>Your focus patterns over the last 7 days</div>
         </div>
         <span style={{ fontSize: 11, color: '#6b6b85', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 12px' }}>
@@ -486,15 +523,18 @@ export default function History() {
         <div style={s.center}>
           <div style={{fontSize:36}}>📊</div>
           <div style={{fontSize:16,fontWeight:600,color:'#9a9ab0'}}>No history yet</div>
-          <div style={{fontSize:13,color:'#6b6b85',maxWidth:300,textAlign:'center',lineHeight:1.6}}>
-            Browse for a few days and come back — your weekly patterns will appear here.
-          </div>
+          <div style={{fontSize:13,color:'#6b6b85',maxWidth:300,textAlign:'center',lineHeight:1.6}}>Browse for a few days and come back — your weekly patterns will appear here.</div>
         </div>
       ) : (
         <>
           <div style={s.section}>
             <div style={s.sectionTitle}>Week at a glance</div>
             <SummaryCards days={days} />
+          </div>
+
+          <div style={s.section}>
+            <div style={s.sectionTitle}>AI weekly digest</div>
+            <AIDigest days={days} hourlyPIArr={hourlyPIArr} />
           </div>
 
           <div style={s.section}>
