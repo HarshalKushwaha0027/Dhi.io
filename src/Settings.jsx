@@ -39,7 +39,7 @@ function normalizeDomain(input) {
 
 function CategoryPicker({ value, onChange }) {
   return (
-    <div style={{ display: 'flex', gap: 6 }}>
+    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
       {CAT_ORDER.map(cat => (
         <button key={cat} onClick={() => onChange(cat)}
           style={{
@@ -102,11 +102,11 @@ function ApiKeyCard() {
 
   const s = {
     card: { background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 12, padding: 20, marginBottom: 22 },
-    title: { fontSize: 13, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 },
+    title: { fontSize: 13, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
     badge: { fontSize: 9, fontWeight: 700, color: '#06D6A0', background: '#06D6A022', border: '1px solid #06D6A055', borderRadius: 4, padding: '2px 6px' },
     desc: { fontSize: 12, color: '#6b6b85', marginBottom: 14, lineHeight: 1.6 },
     row: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' },
-    input: { flex: 1, minWidth: 200, background: '#13131f', border: '1px solid #2a2a3e', borderRadius: 6, padding: '9px 12px', color: '#fff', fontSize: 13, fontFamily: 'monospace', outline: 'none' },
+    input: { flex: 1, minWidth: 160, background: '#13131f', border: '1px solid #2a2a3e', borderRadius: 6, padding: '9px 12px', color: '#fff', fontSize: 13, fontFamily: 'monospace', outline: 'none' },
     btn: { background: '#7C6FFF', color: '#fff', border: 'none', borderRadius: 6, padding: '9px 18px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' },
     removeBtn: { background: 'none', color: '#FF6B6B', border: '1px solid #FF6B6B55', borderRadius: 6, padding: '9px 14px', fontSize: 12, cursor: 'pointer', fontFamily: 'inherit' },
     statusOk: { fontSize: 11, color: '#06D6A0', marginTop: 8 },
@@ -156,8 +156,30 @@ function ApiKeyCard() {
   )
 }
 
+// ── Compact header used when embedded inside the popup ───────────────────────
+function EmbeddedHeader({ onBack, onMaximize }) {
+  const s = {
+    bar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },
+    left: { display: 'flex', alignItems: 'center', gap: 10 },
+    backBtn: { background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 14, padding: '4px 9px', cursor: 'pointer', lineHeight: 1 },
+    title: { fontSize: 14, fontWeight: 700 },
+    maxBtn: { background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 12, padding: '4px 9px', cursor: 'pointer' },
+  }
+  return (
+    <div style={s.bar}>
+      <div style={s.left}>
+        <button style={s.backBtn} onClick={onBack} title="Back to popup">←</button>
+        <span style={s.title}>Dhi.io — Settings</span>
+      </div>
+      <button style={s.maxBtn} onClick={onMaximize} title="Open full page in a tab">⤢ Full tab</button>
+    </div>
+  )
+}
+
 // ── Main Settings page ────────────────────────────────────────────────────────
-export default function Settings() {
+// embedded=true  → rendered inline inside Popup.jsx, with a back/maximize bar
+// embedded=false → standalone page (settings.html via settings-main.jsx), unchanged
+export default function Settings({ embedded = false, onBack, onMaximize } = {}) {
   const [overrides, setOverrides]     = useState({})
   const [domainInput, setDomainInput] = useState('')
   const [pickedCat, setPickedCat]     = useState('productive')
@@ -195,7 +217,7 @@ export default function Settings() {
       await chrome.storage.local.set({ customCategories: updated })
       const { domainStats = {} } = await chrome.storage.local.get(['domainStats'])
       if (domainStats[domain]) {
-        domainStats[domain] = { ...domainStats[domain], category }
+        domainStats[domain] = { ...domainStats[domain], category, source: 'user', guessed: false }
         await chrome.storage.local.set({ domainStats })
       }
     }
@@ -216,7 +238,16 @@ export default function Settings() {
   }
 
   const s = {
-    root: { minHeight: '100vh', background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", padding: '28px 36px 60px', boxSizing: 'border-box', maxWidth: 720, margin: '0 auto' },
+    root: {
+      minHeight: embedded ? 'auto' : '100vh',
+      background: embedded ? 'transparent' : '#13131f',
+      color: '#fff',
+      fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
+      padding: embedded ? '0' : '28px 36px 60px',
+      boxSizing: 'border-box',
+      maxWidth: embedded ? '100%' : 720,
+      margin: embedded ? 0 : '0 auto',
+    },
     header: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 },
     dot: { width: 10, height: 10, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 10px #7C6FFF' },
     title: { fontSize: 20, fontWeight: 700 },
@@ -225,31 +256,40 @@ export default function Settings() {
     cardTitle: { fontSize: 13, fontWeight: 700, marginBottom: 4 },
     cardDesc: { fontSize: 12, color: '#6b6b85', marginBottom: 16, lineHeight: 1.5 },
     inputRow: { display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' },
-    input: { flex: 1, minWidth: 180, background: '#13131f', border: '1px solid #2a2a3e', borderRadius: 6, padding: '9px 12px', color: '#fff', fontSize: 13, fontFamily: 'inherit', outline: 'none' },
+    input: { flex: 1, minWidth: embedded ? 140 : 180, background: '#13131f', border: '1px solid #2a2a3e', borderRadius: 6, padding: '9px 12px', color: '#fff', fontSize: 13, fontFamily: 'inherit', outline: 'none' },
     addBtn: { background: '#7C6FFF', color: '#fff', border: 'none', borderRadius: 6, padding: '9px 18px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' },
     sectionTitle: { fontSize: 11, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12 },
     row: { display: 'flex', alignItems: 'center', gap: 10, padding: '9px 0', borderBottom: '1px solid #1e1e2e' },
-    domainText: { flex: 1, fontSize: 13, color: '#c5c5d8' },
-    removeBtn: { fontSize: 11, color: '#6b6b85', background: 'none', border: '1px solid #2a2a3e', borderRadius: 5, padding: '3px 9px', cursor: 'pointer', fontFamily: 'inherit' },
-    defGrid: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 },
+    domainText: { flex: 1, fontSize: 13, color: '#c5c5d8', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+    removeBtn: { fontSize: 11, color: '#6b6b85', background: 'none', border: '1px solid #2a2a3e', borderRadius: 5, padding: '3px 9px', cursor: 'pointer', fontFamily: 'inherit', flexShrink: 0 },
+    defGrid: { display: 'grid', gridTemplateColumns: embedded ? '1fr 1fr' : '1fr 1fr 1fr', gap: 16 },
     defCol: {},
     defColHeader: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, fontSize: 12, fontWeight: 700 },
     defColDot: (color) => ({ width: 7, height: 7, borderRadius: 2, background: color }),
-    defItem: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', fontSize: 12 },
+    defItem: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 0', fontSize: 12, gap: 6 },
     defItemName: { color: '#9a9ab0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
     empty: { fontSize: 12, color: '#4a4a5e', fontStyle: 'italic', padding: '8px 0' },
-    toast: { position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 8, padding: '10px 20px', fontSize: 13, color: '#fff', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' },
+    toast: { position: embedded ? 'sticky' : 'fixed', bottom: 24, left: embedded ? 'auto' : '50%', transform: embedded ? 'none' : 'translateX(-50%)', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 8, padding: '10px 20px', fontSize: 13, color: '#fff', boxShadow: '0 8px 24px rgba(0,0,0,0.4)' },
   }
 
   const overrideEntries = Object.entries(overrides)
 
   return (
     <div style={s.root}>
-      <div style={s.header}>
-        <div style={s.dot} />
-        <span style={s.title}>Dhi.io — Settings</span>
-      </div>
-      <div style={s.sub}>Teach Dhi how to score a site, and set up your AI weekly digest.</div>
+      {embedded ? (
+        <EmbeddedHeader onBack={onBack} onMaximize={onMaximize} />
+      ) : (
+        <>
+          <div style={s.header}>
+            <div style={s.dot} />
+            <span style={s.title}>Dhi.io — Settings</span>
+          </div>
+          <div style={s.sub}>Teach Dhi how to score a site, and set up your AI weekly digest.</div>
+        </>
+      )}
+
+      {!embedded && <div style={{ marginTop: -14 }} />}
+      {embedded && <div style={{ fontSize: 12, color: '#6b6b85', marginBottom: 18 }}>Teach Dhi how to score a site.</div>}
 
       <ApiKeyCard />
 

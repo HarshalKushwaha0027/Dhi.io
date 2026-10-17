@@ -27,6 +27,8 @@ function hourLabel(h) {
   return `${hh}${period}`
 }
 
+// domainStats passed in here already has its `category` fields resolved
+// against current overrides by buildDays() — see note there.
 function computePI(domainStats) {
   const weights = { productive: 1.0, neutral: 0.5, unproductive: -1.0 }
   const entries = Object.values(domainStats || {})
@@ -101,6 +103,7 @@ async function generateDigest(days, hourlyPIArr, apiKey) {
     Object.entries(day.domainStats || {}).forEach(([domain, val]) => {
       if (!merged[domain]) merged[domain] = { time: 0, category: val?.category || 'neutral' }
       merged[domain].time += val?.time || 0
+      merged[domain].category = val?.category || merged[domain].category
     })
   })
   const topSites = Object.entries(merged)
@@ -155,7 +158,10 @@ Write a 3-4 sentence plain-English summary of their week. Be specific and refere
 }
 
 // ── AI Digest card ────────────────────────────────────────────────────────────
-function AIDigest({ days, hourlyPIArr }) {
+// onOpenSettings: how to get the user to Settings when no key is saved yet.
+// Standalone page → opens settings.html in a new tab (default, unchanged).
+// Embedded in the popup → navigates the popup's own router to the Settings view.
+function AIDigest({ days, hourlyPIArr, onOpenSettings }) {
   const [apiKey, setApiKey]   = useState(null)
   const [digest, setDigest]   = useState(null)
   const [loading, setLoading] = useState(false)
@@ -187,7 +193,8 @@ function AIDigest({ days, hourlyPIArr }) {
     }
   }
 
-  const openSettings = () => {
+  const goToSettings = () => {
+    if (onOpenSettings) { onOpenSettings(); return }
     if (typeof chrome !== 'undefined' && chrome.tabs) {
       chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') })
     }
@@ -210,7 +217,7 @@ function AIDigest({ days, hourlyPIArr }) {
         <div style={s.noKey}>
           Add your free Google Gemini API key in Settings to get a written summary of your week, in your own extension, using your own key.
         </div>
-        <button style={s.btn} onClick={openSettings}>Open Settings</button>
+        <button style={s.btn} onClick={goToSettings}>Open Settings</button>
       </div>
     )
   }
@@ -374,7 +381,9 @@ function SummaryCards({ days }) {
   const totalWeekTime = withData.reduce((s, d) => s + d.totalTime, 0)
 
   const s = {
-    grid: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 24 },
+    // auto-fit instead of a hardcoded repeat(4, 1fr): reflows on its own at
+    // narrower (embedded popup) widths instead of cramping 4 columns in
+    grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10, marginBottom: 24 },
     card: { background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 10, padding: '12px 14px' },
     label: { fontSize: 9, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 },
     val:   { fontSize: 20, fontWeight: 700, color: '#fff' },
@@ -393,11 +402,16 @@ function SummaryCards({ days }) {
 
 // ── Top sites this week ───────────────────────────────────────────────────────
 function TopSitesWeek({ days }) {
+  // `days` runs oldest → newest. Overwriting `category` on every match (instead
+  // of only setting it if absent) means the most recent day's label wins, so a
+  // category you changed today shows up here immediately instead of staying
+  // pinned to whatever it was the first day this domain ever appeared.
   const merged = {}
   days.forEach(day => {
     Object.entries(day.domainStats || {}).forEach(([domain, val]) => {
       if (!merged[domain]) merged[domain] = { time: 0, category: val?.category || 'neutral' }
       merged[domain].time += val?.time || 0
+      merged[domain].category = val?.category || merged[domain].category
     })
   })
   const CAT_COLOR = { productive: '#06D6A0', neutral: '#FFD166', unproductive: '#FF6B6B' }
@@ -427,8 +441,30 @@ function TopSitesWeek({ days }) {
   )
 }
 
+// ── Compact header used when embedded inside the popup ───────────────────────
+function EmbeddedHeader({ onBack, onMaximize }) {
+  const s = {
+    bar: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },
+    left: { display: 'flex', alignItems: 'center', gap: 10 },
+    backBtn: { background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 14, padding: '4px 9px', cursor: 'pointer', lineHeight: 1 },
+    title: { fontSize: 14, fontWeight: 700 },
+    maxBtn: { background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, color: '#9a9ab0', fontSize: 12, padding: '4px 9px', cursor: 'pointer' },
+  }
+  return (
+    <div style={s.bar}>
+      <div style={s.left}>
+        <button style={s.backBtn} onClick={onBack} title="Back to popup">←</button>
+        <span style={s.title}>Dhi.io — Weekly Report</span>
+      </div>
+      <button style={s.maxBtn} onClick={onMaximize} title="Open full page in a tab">⤢ Full tab</button>
+    </div>
+  )
+}
+
 // ── Main History page ─────────────────────────────────────────────────────────
-export default function History() {
+// embedded=true  → rendered inline inside Popup.jsx, with a back/maximize bar
+// embedded=false → standalone page (history.html via history-main.jsx), unchanged
+export default function History({ embedded = false, onBack, onMaximize, onOpenSettings } = {}) {
   const [days, setDays]               = useState([])
   const [hourlyPIArr, setHourlyPIArr] = useState([])
   const [status, setStatus]           = useState('loading')
@@ -436,8 +472,8 @@ export default function History() {
   useEffect(() => {
     const load = () => {
       if (typeof chrome !== 'undefined' && chrome.storage) {
-        chrome.storage.local.get(['domainStats', 'history', 'hourlyToday'], (data) => {
-          buildDays(data.domainStats || {}, data.history || {}, data.hourlyToday || {})
+        chrome.storage.local.get(['domainStats', 'history', 'hourlyToday', 'customCategories'], (data) => {
+          buildDays(data.domainStats || {}, data.history || {}, data.hourlyToday || {}, data.customCategories || {})
         })
       } else {
         const mockHourly = {
@@ -458,17 +494,29 @@ export default function History() {
             [dateKey(5)]: { domainStats: { 'netflix.com': { time: 7200, category: 'unproductive' }, 'youtube.com': { time: 3600, category: 'unproductive' } }, totalTime: 10800, hourly: mockHourly },
             [dateKey(6)]: { domainStats: { 'figma.com': { time: 5400, category: 'productive' }, 'github.com': { time: 3600, category: 'productive' } }, totalTime: 9000, hourly: mockHourly },
           },
-          mockHourly
+          mockHourly,
+          {}
         )
       }
     }
 
-    const buildDays = (todayStats, history, hourlyToday) => {
+    const buildDays = (todayStats, history, hourlyToday, overrides) => {
       const result = []
       for (let i = 6; i >= 0; i--) {
         const key = dateKey(i)
         const isToday = i === 0
-        const stats = isToday ? todayStats : (history[key]?.domainStats || {})
+        const rawStats = isToday ? todayStats : (history[key]?.domainStats || {})
+
+        // domainStats is stored per-domain (one category per domain per day),
+        // never per-visit — so an override can be applied exactly, not just
+        // approximated. This is what makes past days re-color retroactively
+        // when you change a category: the stored snapshot's category is only
+        // ever a fallback for domains you've never explicitly overridden.
+        const stats = {}
+        Object.entries(rawStats).forEach(([domain, val]) => {
+          stats[domain] = { ...val, category: overrides[domain] || val?.category }
+        })
+
         const entries = Object.values(stats)
         const totalTime = entries.reduce((s, x) => s + (x?.time || 0), 0)
         const productiveTime   = entries.filter(x => x?.category === 'productive').reduce((s, x) => s + x.time, 0)
@@ -476,6 +524,10 @@ export default function History() {
         const unproductiveTime = entries.filter(x => x?.category === 'unproductive').reduce((s, x) => s + x.time, 0)
         result.push({ key, isToday, domainStats: stats, totalTime, productiveTime, neutralTime, unproductiveTime, pi: computePI(stats) })
       }
+      // NOTE: hourlyToday / history[date].hourly bucket seconds by category
+      // with no domain attached — there's no domain to resolve an override
+      // against, so Focus Forecast below still reflects the category each
+      // hour's time was originally logged under. See chat note.
       const hourlyBuckets = aggregateHourly(history, hourlyToday)
       setDays(result)
       setHourlyPIArr(computeHourlyPI(hourlyBuckets))
@@ -486,7 +538,16 @@ export default function History() {
   }, [])
 
   const s = {
-    root: { minHeight: '100vh', background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", padding: '28px 36px 48px', boxSizing: 'border-box', maxWidth: 760, margin: '0 auto' },
+    root: {
+      minHeight: embedded ? 'auto' : '100vh',
+      background: embedded ? 'transparent' : '#13131f',
+      color: '#fff',
+      fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif",
+      padding: embedded ? '0' : '28px 36px 48px',
+      boxSizing: 'border-box',
+      maxWidth: embedded ? '100%' : 760,
+      margin: embedded ? 0 : '0 auto',
+    },
     header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 28 },
     logo:   { display: 'flex', alignItems: 'center', gap: 10 },
     dot:    { width: 10, height: 10, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 10px #7C6FFF' },
@@ -495,37 +556,43 @@ export default function History() {
     section:{ marginBottom: 28 },
     sectionTitle: { fontSize: 11, color: '#6b6b85', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 14 },
     divider:{ height: 1, background: '#1e1e2e', margin: '24px 0' },
-    legend: { display: 'flex', gap: 20, marginBottom: 12 },
+    legend: { display: 'flex', gap: 20, marginBottom: 12, flexWrap: 'wrap' },
     legendItem: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#9a9ab0' },
     legendDot: (color) => ({ width: 8, height: 8, borderRadius: 2, background: color }),
-    center: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: 300, gap: 12 },
-  }
-
-  if (status === 'loading') {
-    return <div style={s.root}><div style={s.center}><div style={{fontSize:36}}>⏳</div><div style={{color:'#9a9ab0'}}>Loading history...</div></div></div>
+    center: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: embedded ? 220 : 300, gap: 12 },
   }
 
   const hasAnyData = days.some(d => d.totalTime > 0)
 
   return (
     <div style={s.root}>
-      <div style={s.header}>
-        <div>
-          <div style={s.logo}><div style={s.dot} /><span style={s.title}>Dhi.io — Weekly Report</span></div>
-          <div style={s.sub}>Your focus patterns over the last 7 days</div>
+      {embedded ? (
+        <EmbeddedHeader onBack={onBack} onMaximize={onMaximize} />
+      ) : (
+        <div style={s.header}>
+          <div>
+            <div style={s.logo}><div style={s.dot} /><span style={s.title}>Dhi.io — Weekly Report</span></div>
+            <div style={s.sub}>Your focus patterns over the last 7 days</div>
+          </div>
+          <span style={{ fontSize: 11, color: '#6b6b85', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 12px' }}>
+            {new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
+          </span>
         </div>
-        <span style={{ fontSize: 11, color: '#6b6b85', background: '#1a1a2e', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 12px' }}>
-          {new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
-        </span>
-      </div>
+      )}
 
-      {!hasAnyData ? (
+      {status === 'loading' && (
+        <div style={s.center}><div style={{fontSize:36}}>⏳</div><div style={{color:'#9a9ab0'}}>Loading history...</div></div>
+      )}
+
+      {status === 'ok' && !hasAnyData && (
         <div style={s.center}>
           <div style={{fontSize:36}}>📊</div>
           <div style={{fontSize:16,fontWeight:600,color:'#9a9ab0'}}>No history yet</div>
           <div style={{fontSize:13,color:'#6b6b85',maxWidth:300,textAlign:'center',lineHeight:1.6}}>Browse for a few days and come back — your weekly patterns will appear here.</div>
         </div>
-      ) : (
+      )}
+
+      {status === 'ok' && hasAnyData && (
         <>
           <div style={s.section}>
             <div style={s.sectionTitle}>Week at a glance</div>
@@ -534,7 +601,7 @@ export default function History() {
 
           <div style={s.section}>
             <div style={s.sectionTitle}>AI weekly digest</div>
-            <AIDigest days={days} hourlyPIArr={hourlyPIArr} />
+            <AIDigest days={days} hourlyPIArr={hourlyPIArr} onOpenSettings={onOpenSettings} />
           </div>
 
           <div style={s.section}>
@@ -545,7 +612,7 @@ export default function History() {
           <div style={s.divider} />
 
           <div style={s.section}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
               <div style={s.sectionTitle}>Time breakdown</div>
               <div style={s.legend}>
                 <div style={s.legendItem}><div style={s.legendDot('#06D6A0')} />Productive</div>

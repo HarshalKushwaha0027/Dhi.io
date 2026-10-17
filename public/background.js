@@ -2,8 +2,9 @@
 let currentTabState = { tabId: null, url: null, startTime: null }
 const audioTimers = {}
 let switchLog = []
+let sessionSwitchBuffer = []
 
-// ── Rolling activity buffer — last 30 min of tab visits ──────────────────────
+// ── Rolling activity buffer — last 15 min of tab visits ───────────────────────
 // Each entry: { domain, category, time (secs), timestamp }
 // Used exclusively by the spiral detector. Never persisted to storage.
 let recentActivity = []
@@ -80,25 +81,16 @@ function scoreContent(signals) {
   return { category: winner[0], confidence: Math.round(confidence * 100) }
 }
 
-// ── TLD + domain keyword guesser ──────────────────────────────────────────────
-const TLD_HINTS = { '.edu': 'productive', '.ac.': 'productive', '.gov': 'neutral' }
-const KEYWORD_HINTS = {
-  productive: ['docs','doc','wiki','learn','course','courses','academy','university','code','coding','dev','api','git','ide','build','tutorial','tool','office','design','sheet','sheets','cloud','school','class'],
-  neutral:    ['mail','search','maps','map','weather','news','bank','finance','calendar','translate','forecast'],
-  unproductive: ['game','games','gaming','video','stream','tv','movie','movies','anime','bet','casino','shop','shopping','deal','deals','social','chat','meme','memes','tube','watch']
-}
-
-function guessCategory(domain) {
-  if (!domain) return null
-  for (const [tld, cat] of Object.entries(TLD_HINTS)) {
-    if (domain.includes(tld)) return cat
+// ── Category resolution ─────────────────────────────────────────────────────
+// source values: 'user' (settings override, locked) | 'domain' (hardcoded list,
+// locked) | 'default' (unknown, open to content-tagging and model prediction)
+function getCategory(domain, overrides = {}) {
+  if (!domain) return { category: 'neutral', guessed: false, source: 'default' }
+  if (overrides[domain]) return { category: overrides[domain], guessed: false, source: 'user' }
+  for (const [cat, list] of Object.entries(CATEGORIES)) {
+    if (list.some(d => domain.includes(d))) return { category: cat, guessed: false, source: 'domain' }
   }
-  const base = domain.replace(/\.[a-z]{2,}$/, '')
-  const tokens = base.split(/[.\-]/)
-  for (const [cat, words] of Object.entries(KEYWORD_HINTS)) {
-    if (words.some(w => tokens.includes(w) || domain.includes(w))) return cat
-  }
-  return null
+  return { category: 'neutral', guessed: true, source: 'default' }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -115,17 +107,6 @@ function getDomain(url) {
 function isIgnored(url) {
   if (!url) return true
   return url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('about:')
-}
-
-function getCategory(domain, overrides = {}) {
-  if (!domain) return { category: 'neutral', guessed: false, source: 'default' }
-  if (overrides[domain]) return { category: overrides[domain], guessed: false, source: 'user' }
-  for (const [cat, list] of Object.entries(CATEGORIES)) {
-    if (list.some(d => domain.includes(d))) return { category: cat, guessed: false, source: 'domain' }
-  }
-  const guess = guessCategory(domain)
-  if (guess) return { category: guess, guessed: true, source: 'heuristic' }
-  return { category: 'neutral', guessed: true, source: 'default' }
 }
 
 // ── Spiral detector ───────────────────────────────────────────────────────────
@@ -223,7 +204,176 @@ function runSpiralCheck() {
   }
 }
 
+// ── Behavioral classifier — feature engineering ──────────────────────────────
+// Groups sessionLog by domain, computes per-domain aggregates for any domain
+// with 5+ sessions.
+
+const MIN_SESSIONS_FOR_FEATURES = 5
+
+function computeDomainFeatures(sessionLog) {
+  const byDomain = {}
+  for (const s of sessionLog) {
+    if (!byDomain[s.domain]) byDomain[s.domain] = []
+    byDomain[s.domain].push(s)
+  }
+
+  const features = {}
+  for (const [domain, sessions] of Object.entries(byDomain)) {
+    if (sessions.length < MIN_SESSIONS_FOR_FEATURES) continue
+
+    const n = sessions.length
+    const avgDuration = sessions.reduce((s, x) => s + x.duration, 0) / n
+    const avgSwitches = sessions.reduce((s, x) => s + x.switches, 0) / n
+    const spiralRate  = sessions.filter(x => x.spiral).length / n
+    const audioRate   = sessions.filter(x => x.audio).length / n
+
+    features[domain] = {
+      sessions: n,
+      avgDuration,             // seconds
+      switchRate: avgSwitches, // avg nearby switches per session
+      spiralRate,              // 0–1, fraction of sessions flagged as spiral
+      audioRate,               // 0–1, fraction of sessions with audio
+    }
+  }
+  return features
+}
+
+// ── Behavioral classifier — training pipeline ────────────────────────────────
+
+const CATEGORY_TARGET = { productive: 1.0, neutral: 0.5, unproductive: 0.0 }
+const REFIT_EVERY = 10
+const MIN_TRAINING_DOMAINS = 4  // guard — don't fit on too little data
+
+// Splits feature-eligible domains into:
+//   training  — locked domains (hardcoded list or user-confirmed): these are the labels
+//   candidates — still-open domains the model is allowed to predict for
+//
+// Locking rule: only 'domain' (hardcoded list) and 'user' (manually confirmed
+// via the pill click-to-cycle in Popup.jsx/Settings.jsx) are locked out of
+// prediction. A 'content' tag is NOT a lock — once a domain crosses 5+ sessions,
+// the model automatically takes over and sets source: 'model', overwriting the
+// earlier content-based guess. The user can always override either one manually
+// via the same pill click, which sets source: 'user' and removes it from
+// candidates for good.
+function splitTrainingAndCandidates(features, overrides) {
+  const training = []    // { domain, x: [avgDuration, switchRate, spiralRate, audioRate], y }
+  const candidates = []  // { domain, x: [...] }
+
+  for (const [domain, f] of Object.entries(features)) {
+    const { category, source } = getCategory(domain, overrides)
+    const x = [f.avgDuration, f.switchRate, f.spiralRate, f.audioRate]
+
+    if (source === 'domain' || source === 'user') {
+      training.push({ domain, x, y: CATEGORY_TARGET[category] })
+    } else if (source === 'default') {
+      candidates.push({ domain, x })
+    }
+  }
+  return { training, candidates }
+}
+
+function fitNormalizer(trainingX) {
+  const d = trainingX[0].length
+  const mean = new Array(d).fill(0)
+  const std  = new Array(d).fill(0)
+  const n = trainingX.length
+
+  for (const x of trainingX) for (let j = 0; j < d; j++) mean[j] += x[j] / n
+  for (const x of trainingX) for (let j = 0; j < d; j++) std[j] += (x[j] - mean[j]) ** 2 / n
+  for (let j = 0; j < d; j++) std[j] = Math.sqrt(std[j]) || 1  // avoid /0 if a feature has no variance
+
+  return { mean, std }
+}
+
+function applyNormalizer(x, { mean, std }) {
+  return x.map((v, j) => (v - mean[j]) / std[j])
+}
+
+// Ridge-regularized gradient descent — plain JS, no deps
+function trainModel(X, y, { epochs = 500, lr = 0.05, lambda = 0.1 } = {}) {
+  const n = X.length, d = X[0].length
+  let weights = new Array(d).fill(0)
+  let bias = 0
+
+  for (let e = 0; e < epochs; e++) {
+    const gradW = new Array(d).fill(0)
+    let gradB = 0
+    for (let i = 0; i < n; i++) {
+      const pred = X[i].reduce((s, v, j) => s + v * weights[j], bias)
+      const err = pred - y[i]
+      for (let j = 0; j < d; j++) gradW[j] += err * X[i][j]
+      gradB += err
+    }
+    for (let j = 0; j < d; j++) weights[j] -= lr * (gradW[j] / n + lambda * weights[j])
+    bias -= lr * (gradB / n)
+  }
+  return { weights, bias }
+}
+
+function predict(x, model) {
+  const raw = x.reduce((s, v, j) => s + v * model.weights[j], model.bias)
+  return Math.max(0, Math.min(1, raw))  // clamp to [0,1]
+}
+
+async function runTrainingPipeline() {
+  const { sessionLog = [], customCategories = {} } =
+    await chrome.storage.local.get(['sessionLog', 'customCategories'])
+
+  const features = computeDomainFeatures(sessionLog)
+  const { training, candidates } = splitTrainingAndCandidates(features, customCategories)
+
+  if (training.length < MIN_TRAINING_DOMAINS || candidates.length === 0) {
+    console.log(`🧠 Skipping fit — ${training.length} training domains, ${candidates.length} candidates`)
+    return
+  }
+
+  const normalizer = fitNormalizer(training.map(t => t.x))
+  const X = training.map(t => applyNormalizer(t.x, normalizer))
+  const y = training.map(t => t.y)
+  const model = trainModel(X, y)
+
+  const { domainStats = {} } = await chrome.storage.local.get(['domainStats'])
+  const updatedStats = { ...domainStats }
+  for (const c of candidates) {
+    const score = predict(applyNormalizer(c.x, normalizer), model)
+    const predictedCategory = score > 0.67 ? 'productive' : score > 0.33 ? 'neutral' : 'unproductive'
+    const existing = updatedStats[c.domain]
+    updatedStats[c.domain] = {
+      ...(existing || { time: 0, title: null }),
+      category: predictedCategory,
+      guessed: true,
+      source: 'model',
+      modelScore: Math.round(score * 100),
+    }
+  }
+
+  await chrome.storage.local.set({
+    domainStats: updatedStats,
+    mlModel: { weights: model.weights, bias: model.bias, normalizer, trainedAt: Date.now(), trainingCount: training.length },
+  })
+  console.log(`🧠 Refit complete — ${training.length} training domains, predicted ${candidates.length}`)
+}
+
 // ── Save time ─────────────────────────────────────────────────────────────────
+
+async function logSession(domain, duration, category, nearbySwitches, spiralFlag, isAudio) {
+  const { sessionLog = [] } = await chrome.storage.local.get(['sessionLog'])
+  sessionLog.push({
+    domain, duration, category,
+    switches: nearbySwitches,
+    spiral: spiralFlag,
+    hour: new Date().getHours(),
+    audio: isAudio,
+    ts: Date.now(),
+  })
+  if (sessionLog.length > 500) sessionLog.shift()
+  await chrome.storage.local.set({ sessionLog })
+
+  if (sessionLog.length % REFIT_EVERY === 0) {
+    runTrainingPipeline()   // fire-and-forget — don't block saveTimeSpent()
+  }
+}
+
 async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!domain) return
   const weighted = timeInSeconds * weight
@@ -235,11 +385,12 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   const hourlyToday = data.hourlyToday      || {}
 
   const existing = stats[domain]
-  const { category, guessed, source } = existing?.source === 'content'
-    ? { category: existing.category, guessed: existing.guessed, source: 'content' }
+  const { category, guessed, source } = (existing?.source === 'content' || existing?.source === 'model')
+    ? { category: existing.category, guessed: existing.guessed, source: existing.source }
     : getCategory(domain, overrides)
 
   stats[domain] = {
+    ...existing,
     time: (existing?.time || 0) + weighted,
     category, guessed, source,
     title: existing?.title || null,
@@ -249,9 +400,15 @@ async function saveTimeSpent(domain, timeInSeconds, weight = 1.0) {
   if (!hourlyToday[hour]) hourlyToday[hour] = { productive: 0, neutral: 0, unproductive: 0 }
   hourlyToday[hour][category] = (hourlyToday[hour][category] || 0) + weighted
 
-  // Push into rolling buffer for spiral detection
+  // Push into rolling buffer first, so this session itself can count toward the spiral check
   recentActivity.push({ domain, category, time: weighted, timestamp: Date.now() })
 
+  const nearbySwitches = sessionSwitchBuffer.filter(t => Date.now() - t < 2 * 60 * 1000).length
+  const spiralCheck = detectSpiral()
+  const spiralFlag = spiralCheck.spiral && spiralCheck.spiralDomains.includes(domain)
+  const isAudio = weight !== 1.0   // true for the 0.3× audio-weighted calls — flag if you ever add a third weight
+
+  await logSession(domain, weighted, category, nearbySwitches, spiralFlag, isAudio)
   await chrome.storage.local.set({ domainStats: stats, hourlyToday })
   console.log(`💾 ${domain} [${category} via ${source}${guessed ? ' •guess' : ''}]: +${weighted.toFixed(1)}s`)
 }
@@ -290,6 +447,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // Reset spiral state at midnight too
     recentActivity = []
     spiralState = { warned: false, notified: false, detectedAt: null, clearedAt: null }
+    // sessionSwitchBuffer is time-pruned anyway, but reset for cleanliness
+    sessionSwitchBuffer = []
+
+    // NOTE: sessionLog is intentionally NOT cleared here — it's the training
+    // data for the behavioral classifier (Stage 2/3) and needs to accumulate
+    // across days to reach 5+ sessions per domain.
 
     await chrome.storage.local.set({ domainStats: {}, history, hourlyToday: {} })
     console.log(`🌅 Daily reset — saved ${todayKey} to history`)
@@ -314,6 +477,9 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     })
     switchLog = []
   }
+
+  sessionSwitchBuffer.push(now)
+  sessionSwitchBuffer = sessionSwitchBuffer.filter(t => now - t < 2 * 60 * 1000)
 
   if (currentTabState.tabId !== null && currentTabState.startTime !== null) {
     const timeSpent = (now - currentTabState.startTime) / 1000
@@ -405,9 +571,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           title: request.title,
           contentSuggestion: result.category,
           contentConfidence: result.confidence,
-          category:  domainResult.source === 'heuristic' ? result.category : existing.category,
-          guessed:   domainResult.source === 'heuristic' ? true : existing.guessed,
-          source:    domainResult.source === 'heuristic' ? 'content' : existing.source,
+          category:  domainResult.source === 'default' ? result.category : existing.category,
+          guessed:   domainResult.source === 'default' ? true : existing.guessed,
+          source:    domainResult.source === 'default' ? 'content' : existing.source,
         }
       } else {
         stats[domain] = {

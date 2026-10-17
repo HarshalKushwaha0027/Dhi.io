@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react'
+import Settings from './Settings.jsx'
+import History from './History.jsx'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmt(secs) {
@@ -172,7 +174,6 @@ function SpiralWarning({ warning, onDismiss }) {
       alignItems: 'flex-start',
       gap: 10,
     }}>
-      {/* Animated spiral icon */}
       <span style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>🌀</span>
       <div style={{ flex: 1 }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: '#F77F00', marginBottom: 3 }}>
@@ -195,14 +196,51 @@ function SpiralWarning({ warning, onDismiss }) {
   )
 }
 
+// ── View sizing ────────────────────────────────────────────────────────────────
+// Chrome caps extension popups at 800×600px — hard limit. Main view stays
+// compact; Settings/History widen for readability but stay well under the cap,
+// and rely on internal scroll (maxHeight + overflowY) rather than clipping.
+const VIEW_WIDTH = { main: 360, settings: 520, history: 520 }
+const POPUP_MAX_HEIGHT = 600
+
 // ── Main popup ────────────────────────────────────────────────────────────────
 export default function Popup() {
+  const [view, setView]             = useState('main') // 'main' | 'settings' | 'history'
   const [sites, setSites]           = useState([])
   const [total, setTotal]           = useState(0)
   const [pi, setPI]                 = useState(0)
   const [switches, setSwitches]     = useState(0)
   const [spiralWarning, setSpiral]  = useState({ active: false })
   const [status, setStatus]         = useState('loading')
+
+  // Kill the browser's default body margin and native scrollbar so the popup's
+  // own document never scrolls — only the inner root div (capped at 600px) does.
+  // Without this, two scrollbars show up at once: the native one (triggered by
+  // the default 8px body margin pushing total height past Chrome's 600px popup
+  // cap) and our own.
+  useEffect(() => {
+    document.documentElement.style.margin = '0'
+    document.documentElement.style.padding = '0'
+    document.body.style.margin = '0'
+    document.body.style.padding = '0'
+    document.body.style.overflow = 'hidden'
+
+    // Thin, theme-matched scrollbar instead of the OS/browser default —
+    // injected once since inline React styles can't reach ::-webkit-scrollbar.
+    const styleId = 'dhi-scrollbar-style'
+    if (!document.getElementById(styleId)) {
+      const style = document.createElement('style')
+      style.id = styleId
+      style.textContent = `
+        .dhi-scroll::-webkit-scrollbar { width: 6px; }
+        .dhi-scroll::-webkit-scrollbar-track { background: transparent; }
+        .dhi-scroll::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 3px; }
+        .dhi-scroll::-webkit-scrollbar-thumb:hover { background: #3a3a52; }
+        .dhi-scroll { scrollbar-width: thin; scrollbar-color: #2a2a3e transparent; }
+      `
+      document.head.appendChild(style)
+    }
+  }, [])
 
   useEffect(() => {
     const processStats = (raw, switchCount = 0, spiral = { active: false }) => {
@@ -289,11 +327,24 @@ export default function Popup() {
     })
   }
 
-  const openHistory  = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }) }
-  const openSettings = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') }) }
+  // Full-tab escape hatches — used both as the "maximize" action from inside
+  // an embedded panel, and (for history, until History.jsx is wired in) as
+  // the view's only entry point for now.
+  const openHistoryTab  = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('history.html') }) }
+  const openSettingsTab = () => { if (typeof chrome !== 'undefined' && chrome.tabs) chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') }) }
+
+  const width = VIEW_WIDTH[view]
 
   const s = {
-    root: { width: 360, minHeight: 500, background: '#13131f', color: '#fff', fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", fontSize: 13, padding: '14px 16px 18px', boxSizing: 'border-box', userSelect: 'none' },
+    root: {
+      width,
+      maxHeight: POPUP_MAX_HEIGHT,
+      overflowY: 'auto',
+      background: '#13131f', color: '#fff',
+      fontFamily: "'Inter', 'Segoe UI', system-ui, sans-serif", fontSize: 13,
+      padding: '14px 16px 18px', boxSizing: 'border-box', userSelect: 'none',
+      transition: 'width 0.22s ease',
+    },
     header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
     logo:    { display: 'flex', alignItems: 'center', gap: 8 },
     logoDot: { width: 8, height: 8, borderRadius: '50%', background: '#7C6FFF', boxShadow: '0 0 8px #7C6FFF' },
@@ -319,19 +370,46 @@ export default function Popup() {
     clearBtn: { fontSize: 11, color: '#6b6b85', background: 'none', border: '1px solid #2a2a3e', borderRadius: 6, padding: '4px 14px', cursor: 'pointer' },
   }
 
+  // ── Settings view ─────────────────────────────────────────────────────────
+  if (view === 'settings') {
+    return (
+      <div style={s.root} className="dhi-scroll">
+        <Settings
+          embedded
+          onBack={() => setView('main')}
+          onMaximize={openSettingsTab}
+        />
+      </div>
+    )
+  }
+
+  // ── History view ──────────────────────────────────────────────────────────
+  if (view === 'history') {
+    return (
+      <div style={s.root} className="dhi-scroll">
+        <History
+          embedded
+          onBack={() => setView('main')}
+          onMaximize={openHistoryTab}
+          onOpenSettings={() => setView('settings')}
+        />
+      </div>
+    )
+  }
+
+  // ── Main view ─────────────────────────────────────────────────────────────
   return (
-    <div style={s.root}>
+    <div style={s.root} className="dhi-scroll">
       <div style={s.header}>
         <div style={s.logo}>
           <div style={s.logoDot}/>
           <span style={s.logoText}>Dhi.io</span>
-          {/* Spiral badge in logo area — subtle amber dot when warning active */}
           {spiralWarning?.active && (
             <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#F77F00', boxShadow: '0 0 6px #F77F00', marginLeft: 2 }} />
           )}
         </div>
         <div style={s.headerRight}>
-          <button style={s.gearBtn} onClick={openSettings} title="Category settings">⚙</button>
+          <button style={s.gearBtn} onClick={() => setView('settings')} title="Category settings">⚙</button>
           <span style={s.pill}>LIVE</span>
         </div>
       </div>
@@ -341,7 +419,6 @@ export default function Popup() {
       {status === 'empty'   && <div style={s.center}><div style={{fontSize:32}}>🎯</div><div style={{fontSize:14,fontWeight:600,color:'#9a9ab0'}}>No data yet</div><div style={{fontSize:12,color:'#6b6b85',maxWidth:220,lineHeight:1.6}}>Browse a few tabs and come back.</div></div>}
 
       {status === 'ok' && <>
-        {/* Spiral warning — shows above chart when active */}
         <SpiralWarning warning={spiralWarning} onDismiss={dismissSpiral} />
 
         <div style={s.topRow}>
@@ -382,7 +459,7 @@ export default function Popup() {
 
         <div style={s.footer}>
           <button style={s.clearBtn} onClick={clearData}>Reset today's data</button>
-          <button style={{...s.clearBtn, color:'#7C6FFF', borderColor:'#7C6FFF55'}} onClick={openHistory}>Weekly report →</button>
+          <button style={{...s.clearBtn, color:'#7C6FFF', borderColor:'#7C6FFF55'}} onClick={() => setView('history')}>Weekly report →</button>
         </div>
       </>}
     </div>
